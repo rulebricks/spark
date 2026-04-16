@@ -22,11 +22,9 @@ scored.display()
 
 Rule outputs become columns. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
 
----
-
 ## Why
 
-Your business logic shouldn't live in notebooks or SQL CASE statements. Rulebricks lets non-engineers author decision tables in a visual UI, with versioning, audit logs, and test suites. `rulebricks-spark` lets your Spark pipelines call those rules without wrapping the HTTP API yourself.
+Changing business & policy logic shouldn't live in notebooks or SQL CASE statements. Rulebricks enables business users to directly author & manage decision tables in a visual UI, with versioning, audit logs, and test suites. `rulebricks-spark` then lets your Spark pipelines consume those rules at scale without wrapping the HTTP API yourself.
 
 **Edit a rule in the Rulebricks UI. Rerun your notebook. Different results, no code change.**
 
