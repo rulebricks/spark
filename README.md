@@ -18,7 +18,7 @@ scored = solve(
 scored.display()
 ```
 
-![Apply a Rulebricks rule to a Spark DataFrame — input columns in, rule output columns appended](assets/cover.png)
+![Apply a Rulebricks rule to a Spark DataFrame — input columns in, rule output columns appended](https://raw.githubusercontent.com/rulebricks/spark/main/assets/cover.png)
 
 Rule outputs overwrite existing columns, or automatically create new ones. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
 
@@ -205,7 +205,7 @@ Retries run automatically for 408 / 425 / 429 / 500 / 502 / 503 / 504, timeouts,
 ## Development
 
 ```bash
-git clone https://github.com/rulebricks/rulebricks-spark
+git clone https://github.com/rulebricks/spark
 cd rulebricks-spark
 pip install -e ".[dev]"
 pytest
@@ -232,4 +232,4 @@ MIT — see [LICENSE](LICENSE).
 - [Rulebricks Homepage](https://rulebricks.com)
 - [Rulebricks User Guide](https://rulebricks.com/docs)
 - [Python SDK reference](https://rulebricks.com/docs/api-reference#sdk/python)
-- [Issues & feature requests](https://github.com/rulebricks/rulebricks-spark/issues)
+- [Issues & feature requests](https://github.com/rulebricks/spark/issues)

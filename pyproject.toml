@@ -54,9 +54,9 @@ dev = [
 [project.urls]
 Homepage = "https://rulebricks.com"
 Documentation = "https://rulebricks.com/docs"
-Repository = "https://github.com/rulebricks/rulebricks-spark"
-Issues = "https://github.com/rulebricks/rulebricks-spark/issues"
-Changelog = "https://github.com/rulebricks/rulebricks-spark/blob/main/CHANGELOG.md"
+Repository = "https://github.com/rulebricks/spark"
+Issues = "https://github.com/rulebricks/spark/issues"
+Changelog = "https://github.com/rulebricks/spark/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/rulebricks_spark/_version.py"
