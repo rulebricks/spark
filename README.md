@@ -20,7 +20,7 @@ scored.display()
 
 ![Apply a Rulebricks rule to a Spark DataFrame — input columns in, rule output columns appended](assets/cover.png)
 
-Rule outputs become columns. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
+Rule outputs overwrite existing columns, or automatically create new ones. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
 
 ## Why
 
