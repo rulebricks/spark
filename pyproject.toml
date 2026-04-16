@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rulebricks-spark"
+dynamic = ["version"]
+description = "Apache Spark integration for Rulebricks — apply decision-table based rules to Spark DataFrames at scale."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Rulebricks", email = "support@rulebricks.com" },
+]
+keywords = [
+    "rulebricks",
+    "spark",
+    "pyspark",
+    "databricks",
+    "rules-engine",
+    "decision-tables",
+    "business-rules",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "rulebricks>=1.0.0",
+    "pyspark>=3.3",
+    "pandas>=1.5",
+    "pyarrow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "mypy>=1.0",
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[project.urls]
+Homepage = "https://rulebricks.com"
+Documentation = "https://rulebricks.com/docs"
+Repository = "https://github.com/rulebricks/rulebricks-spark"
+Issues = "https://github.com/rulebricks/rulebricks-spark/issues"
+Changelog = "https://github.com/rulebricks/rulebricks-spark/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/rulebricks_spark/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rulebricks_spark"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/rulebricks_spark",
+    "tests",
+    "examples",
+    "assets",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "requires_spark: tests that need a running Spark session",
+    "requires_network: tests that hit the Rulebricks API",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
