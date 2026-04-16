@@ -408,11 +408,11 @@ def _make_executor_client(config: SolveConfig):
             "`%pip install rulebricks-spark` in the notebook."
         ) from e
 
-    if config.base_url and config.base_url != "https://rulebricks.com":
-        try:
-            return Rulebricks(api_key=config.api_key, base_url=config.base_url)
-        except TypeError:
-            import os
+    try:
+        return Rulebricks(api_key=config.api_key, base_url=config.base_url)
+    except TypeError:
+        # Older SDK without a base_url kwarg: fall back to env var convention.
+        import os
 
-            os.environ.setdefault("RULEBRICKS_API_URL", config.base_url)
-    return Rulebricks(api_key=config.api_key)
+        os.environ.setdefault("RULEBRICKS_API_URL", config.base_url)
+        return Rulebricks(api_key=config.api_key)

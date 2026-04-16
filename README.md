@@ -80,7 +80,7 @@ Effective parallelism = `num_executors × max_concurrent_requests_per_partition`
 | `df`                                    | —                        | Input Spark DataFrame.                                             |
 | `rule`                                  | —                        | Rulebricks rule slug.                                              |
 | `api_key`                               | —                        | Your Rulebricks API key.                                           |
-| `base_url`                              | `https://rulebricks.com` | Override for self-hosted deployments.                              |
+| `base_url`                              | `https://rulebricks.com/api/v1` | Override for self-hosted deployments (include `/api/v1`).   |
 | `batch_size`                            | `500`                    | Rows per `bulk_solve` call (max 1000).                             |
 | `max_concurrent_requests_per_partition` | `4`                      | Concurrent batches per Spark partition.                            |
 | `input_mapping`                         | `None`                   | `{df_column: rule_field}` for renaming inputs.                     |
@@ -130,7 +130,7 @@ solve(
     df,
     rule="underwriting",
     api_key=key,
-    base_url="https://rules.acme.internal",
+    base_url="https://rules.acme.internal/api/v1",
 )
 ```
 

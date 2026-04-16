@@ -33,7 +33,7 @@ def register_udf(
     rule: str,
     *,
     api_key: str,
-    base_url: str = "https://rulebricks.com",
+    base_url: str = "https://rulebricks.com/api/v1",
     output_schema: Optional[StructType] = None,
     batch_size: int = 500,
 ) -> StructType:
@@ -56,8 +56,9 @@ def register_udf(
     api_key : str
         Rulebricks API key. In Databricks, retrieve via
         ``dbutils.secrets.get(scope, key)``.
-    base_url : str, default 'https://rulebricks.com'
-        Override for self-hosted deployments.
+    base_url : str, default 'https://rulebricks.com/api/v1'
+        Override for self-hosted deployments. The ``/api/v1`` suffix is
+        required.
     output_schema : StructType, optional
         Explicit return schema (rule outputs only — ``_rb_error`` is appended
         automatically). Omitting this triggers a single driver-side API call

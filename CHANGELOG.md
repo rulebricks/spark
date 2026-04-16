@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1 (2026-04-16)
+
+Bug fix: default `base_url` now includes the required `/api/v1` path, and
+the underlying Rulebricks SDK is always invoked with an explicit `base_url`.
+Previous versions relied on the SDK's implicit default, which some `rulebricks`
+SDK releases ship URL-encoded, causing httpx to raise "Request URL is missing
+an 'http://' or 'https://' protocol" on every call.
+
+- `solve()` default `base_url` changed from `https://rulebricks.com` to `https://rulebricks.com/api/v1`.
+- `rulebricks_spark.databricks.register_udf()` default `base_url` changed to `https://rulebricks.com/api/v1`.
+- Self-hosted deployments must now include the `/api/v1` suffix in `base_url`.
+
 ## 0.1.0 (2026-04-16)
 
 Initial release.

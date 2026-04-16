@@ -17,7 +17,10 @@
 # COMMAND ----------
 
 # MAGIC %pip install rulebricks-spark
-# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
 
 # COMMAND ----------
 

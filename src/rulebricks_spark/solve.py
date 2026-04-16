@@ -26,7 +26,7 @@ def solve(
     rule: str,
     *,
     api_key: str,
-    base_url: str = "https://rulebricks.com",
+    base_url: str = "https://rulebricks.com/api/v1",
     batch_size: int = 500,
     max_concurrent_requests_per_partition: int = 4,
     input_mapping: Optional[Dict[str, str]] = None,
@@ -56,9 +56,10 @@ def solve(
     api_key : str
         Rulebricks API key. In Databricks, retrieve via
         ``dbutils.secrets.get(scope, key)``.
-    base_url : str, default 'https://rulebricks.com'
+    base_url : str, default 'https://rulebricks.com/api/v1'
         API base URL. Override for self-hosted deployments, e.g.
-        ``https://rulebricks.yourcompany.com``.
+        ``https://rulebricks.yourcompany.com/api/v1``. The ``/api/v1``
+        suffix is required; pass the full API base URL, not the web host.
     batch_size : int, default 500
         Rows per ``bulk_solve`` HTTP call. Hard-capped at 1000 by the API.
         Larger batches improve throughput until rule complexity or payload

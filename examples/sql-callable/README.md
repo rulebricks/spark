@@ -142,7 +142,7 @@ register_udf(
     "rulebricks_triage",
     rule=RULE_SLUG,
     api_key=api_key,
-    base_url="https://rulebricks.acme.internal",
+    base_url="https://rulebricks.acme.internal/api/v1",
 )
 ```
 

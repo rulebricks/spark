@@ -189,18 +189,22 @@ def rb_types_from_spark_schema(schema: StructType) -> List[Tuple[str, str]]:
 
 
 def _make_client(api_key: str, base_url: str):
-    """Instantiate a Rulebricks client, accommodating SDK versions without base_url."""
+    """Instantiate a Rulebricks client, always passing ``base_url`` explicitly.
+
+    We deliberately don't fall back to the SDK's implicit default because
+    some SDK versions ship a URL-encoded default that breaks httpx request
+    construction.
+    """
     from rulebricks import Rulebricks
 
-    if base_url and base_url != "https://rulebricks.com":
-        try:
-            return Rulebricks(api_key=api_key, base_url=base_url)
-        except TypeError:
-            # Older SDK: fall back to env var convention
-            import os
+    try:
+        return Rulebricks(api_key=api_key, base_url=base_url)
+    except TypeError:
+        # Older SDK without a base_url kwarg: fall back to env var convention.
+        import os
 
-            os.environ.setdefault("RULEBRICKS_API_URL", base_url)
-    return Rulebricks(api_key=api_key)
+        os.environ.setdefault("RULEBRICKS_API_URL", base_url)
+        return Rulebricks(api_key=api_key)
 
 
 def _find_rule_by_slug(rules: Any, slug: str) -> Optional[Any]:
