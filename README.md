@@ -18,7 +18,9 @@ scored = solve(
 scored.display()
 ```
 
-One function. Rule outputs become columns. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
+![Apply a Rulebricks rule to a Spark DataFrame — input columns in, rule output columns appended](assets/cover.png)
+
+Rule outputs become columns. Works in any PySpark environment — Databricks, EMR, Synapse, or a local cluster.
 
 ---
 
@@ -64,26 +66,6 @@ scored.write.mode("overwrite").saveAsTable("claims_scored")
 Rule output fields are appended as new columns. A trailing `_rb_error` column is `null` on success and carries the error message on failure, so you can isolate problem rows without failing the whole job.
 
 ## How it works
-
-```
-                    ┌────────────────────────────────┐
-                    │      Spark Driver              │
-                    │  fetches rule schema once      │
-                    └────────────────┬───────────────┘
-                                     │ broadcast config
-                    ┌────────────────┼────────────────┐
-                    ▼                ▼                ▼
-              ┌──────────┐    ┌──────────┐    ┌──────────┐
-              │ Executor │    │ Executor │    │ Executor │
-              │  ┌────┐  │    │  ┌────┐  │    │  ┌────┐  │
-              │  │batch│ ─┼────┼──│batch│ ─┼────┼──│batch│ ──┐
-              │  └────┘  │    │  └────┘  │    │  └────┘  │   │
-              └──────────┘    └──────────┘    └──────────┘   ▼
-                                                     ┌────────────┐
-                                                     │ Rulebricks │
-                                                     │ bulk_solve │
-                                                     └────────────┘
-```
 
 1. **Driver side:** fetch the rule's response schema once via the Rulebricks SDK, build the Spark output `StructType`.
 2. **Executor side:** each partition's pandas chunks are split into batches (default 500 rows) and sent to `bulk_solve`. Multiple batches per partition run concurrently in a thread pool (default 4).
@@ -249,7 +231,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Links
 
-- [Rulebricks homepage](https://rulebricks.com)
-- [Rulebricks documentation](https://rulebricks.com/docs)
-- [Python SDK reference](https://rulebricks.com/docs/sdk/python)
+- [Rulebricks Homepage](https://rulebricks.com)
+- [Rulebricks User Guide](https://rulebricks.com/docs)
+- [Python SDK reference](https://rulebricks.com/docs/api-reference#sdk/python)
 - [Issues & feature requests](https://github.com/rulebricks/rulebricks-spark/issues)
