@@ -4,6 +4,9 @@
 
 [![PyPI](https://img.shields.io/pypi/v/rulebricks-spark.svg)](https://pypi.org/project/rulebricks-spark/)
 
+
+![Reference Documentation](https://rulebricks-spark.readthedocs.io)
+
 Apply versioned Rulebricks rules and flows to PySpark DataFrames. The library
 sends records in bounded requests and keeps each decision, error, and execution
 ID alongside its source data, so the pipeline can scale without losing the ability
