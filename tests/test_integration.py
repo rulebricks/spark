@@ -290,6 +290,56 @@ def test_resume_reads_saved_contract_and_only_reexecutes_selected_rows(spark, ap
     assert rows[1].rulebricks_meta.diagnostics.attempt_history[0].http_status == 503
 
 
+@pytest.mark.parametrize("payload_format", ["json", "struct"])
+def test_resume_preserves_payload_column_and_only_retries_failures(
+    spark, api, tmp_path, payload_format
+):
+    payloads = [{"id": index, "customer": {"country": "US", "reference": None}} for index in (0, 1)]
+    source = spark.createDataFrame(
+        [(index, json.dumps(payload)) for index, payload in enumerate(payloads)],
+        ["audit_id", "payload"],
+    )
+    if payload_format == "struct":
+        source = source.withColumn(
+            "payload",
+            functions.from_json(
+                "payload", "id long, customer struct<country:string,reference:string>"
+            ),
+        )
+    api.handler = lambda request: (
+        httpx.Response(503, text="unavailable")
+        if json.loads(request.content)[0]["id"] == 1
+        else echo(request)
+    )
+    path = str(tmp_path / "payload-run")
+    apply_flow(
+        source,
+        "decision",
+        **api.options,
+        version="3",
+        payload_column="payload",
+        correlation_id_path="id",
+        max_batch_rows=1,
+        max_retries=0,
+    ).write.parquet(path)
+    saved = spark.read.parquet(path)
+    initial = {row.audit_id: row for row in saved.collect()}
+    assert initial[1].rulebricks_meta.error.type == "infrastructure"
+    api.requests.clear()
+    api.handler = echo
+
+    rows = sorted(resume(saved, **api.options).collect(), key=lambda row: row.audit_id)
+
+    assert len(api.requests) == 1
+    assert json.loads(api.requests[0].content) == [payloads[1]]
+    assert api.requests[0].url.path == "/api/v1/flows/decision/3"
+    assert rows[0] == initial[0]
+    assert rows[1].payload == initial[1].payload
+    assert [json.loads(row.rulebricks_result) for row in rows] == payloads
+    assert [row.rulebricks_meta.correlation_id for row in rows] == ["0", "1"]
+    assert [row.rulebricks_meta.attempts for row in rows] == [1, 2]
+
+
 def test_resume_rejects_replayable_lineage_and_changed_contracts(spark, api):
     api.handler = lambda request: httpx.Response(503, text="unavailable")
     pending = apply_flow(spark.range(1), "decision", **api.options, max_retries=0).cache()

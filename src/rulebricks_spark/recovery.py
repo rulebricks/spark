@@ -145,7 +145,7 @@ def resume(
         api_key=api_key,
         base_url=base_url,
         version=contract["version"],
-        input_columns=contract.get("input_columns"),
+        input_columns=None if contract.get("payload_column") else contract.get("input_columns"),
         payload_column=contract.get("payload_column"),
         input_mapping=contract.get("input_mapping"),
         correlation_id_path=contract.get("correlation_id_path"),
