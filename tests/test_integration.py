@@ -1,266 +1,351 @@
-"""End-to-end tests with a real local Spark session and fake Rulebricks clients.
+"""Public API through Spark workers, the generated SDK, and a local HTTP server."""
 
-Uses the ``_client_class`` test hook on ``solve()`` to inject a deterministic
-in-process client that runs on Spark executors without network calls. Fake
-clients are defined at **module level** so they are picklable across worker
-processes.
+import json
+import time
+import uuid
+from decimal import Decimal
 
-Marked ``requires_spark`` — skipped automatically if PySpark is unavailable.
-"""
-
+import httpx
 import pytest
-
-pyspark = pytest.importorskip("pyspark")
-from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import (  # noqa: E402
-    BooleanType,
-    DoubleType,
+from pyspark.sql import functions
+from pyspark.sql.types import (
+    ArrayType,
+    DecimalType,
+    LongType,
+    MapType,
     StringType,
     StructField,
     StructType,
 )
 
+from rulebricks_spark import ResponseOptions, apply_flow, apply_rule, resume
+from rulebricks_spark.sql import register_udf
+from tests.conftest import ROOT_ID, echo
+
 pytestmark = pytest.mark.requires_spark
 
 
-# ---------------------------------------------------------------------------
-# Module-level fake clients (must be picklable for Spark workers)
-# ---------------------------------------------------------------------------
-
-class _FakeRulesAPI:
-    """Deterministic bulk_solve: P1 if financial_impact > 1M, else P3."""
-
-    def bulk_solve(self, slug, request):
-        return [
-            {
-                "priority": "P1" if row.get("financial_impact", 0) > 1_000_000 else "P3",
-                "reportable": bool(row.get("customer_harm", False)),
-                "risk_score": float(row.get("financial_impact", 0)) / 1_000_000.0,
-            }
-            for row in request
-        ]
+def business_error(item):
+    return item.get("failure", {}).get("message")
 
 
-class FakeClient:
-    def __init__(self, api_key=None, **kwargs):
-        self.rules = _FakeRulesAPI()
+def unwrap(item):
+    return item["data"]
 
 
-class _FailingRulesAPI:
-    def bulk_solve(self, slug, request):
-        raise RuntimeError("simulated API failure")
+def test_versioned_preflight_and_nested_output(spark, api):
+    def decision(request):
+        if request.method == "GET":
+            assert dict(request.url.params) == {"slug": "decision", "version": "3"}
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "slug": "decision",
+                        "published": True,
+                        "request_schema": [{"key": "customer.country", "type": "string"}],
+                        "response_schema": [
+                            {"key": "decision", "type": "object"},
+                            {"key": "decision.approved", "type": "boolean"},
+                        ],
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[{"decision": {"approved": True}}])
 
-
-class FailingClient:
-    def __init__(self, api_key=None, **kwargs):
-        self.rules = _FailingRulesAPI()
-
-
-# Track batch call counts via a module-level list shared in local mode.
-_batch_log = []
-
-
-class _TrackingRulesAPI:
-    def bulk_solve(self, slug, request):
-        _batch_log.append(len(request))
-        return [
-            {
-                "priority": "P3",
-                "reportable": False,
-                "risk_score": 0.0,
-            }
-            for _ in request
-        ]
-
-
-class TrackingClient:
-    def __init__(self, api_key=None, **kwargs):
-        self.rules = _TrackingRulesAPI()
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def spark():
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("rulebricks-spark-tests")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        .getOrCreate()
+    api.handler = decision
+    source = spark.createDataFrame([("US",)], ["country"])
+    with pytest.raises(ValueError, match="customer.country: missing"):
+        apply_rule(source, "decision", **api.options, version="3", input_validation="strict")
+    assert len(api.requests) == 1 and api.requests[0].method == "GET"
+    with pytest.warns(UserWarning, match="customer.country"):
+        warned = apply_flow(source, "decision", **api.options, version="3", input_validation="warn")
+    contract = warned.schema["rulebricks_meta"].metadata["rulebricks_contract"]
+    assert contract["input_warnings"] == ["customer.country: missing declared input"]
+    assert all(request.method == "GET" for request in api.requests)
+    assert warned.collect()[0].rulebricks_meta.status == "ok"
+    source = source.select(functions.struct("country").alias("source"))
+    result = apply_rule(
+        source,
+        "decision",
+        **api.options,
+        version="3",
+        input_mapping={"source": "customer"},
+        input_validation="strict",
     )
-    yield session
-    session.stop()
+    assert result.collect()[0].rulebricks_result.decision.approved is True
+    assert json.loads(api.requests[-1].content) == [{"customer": {"country": "US"}}]
 
 
-@pytest.fixture
-def rule_schema():
-    return StructType([
-        StructField("priority", StringType(), nullable=True),
-        StructField("reportable", BooleanType(), nullable=True),
-        StructField("risk_score", DoubleType(), nullable=True),
-    ])
+@pytest.mark.parametrize("apply", [apply_flow, apply_rule])
+@pytest.mark.parametrize("typed", [False, True])
+def test_batch_alignment_and_audit(spark, api, apply, typed):
+    responses = [{"score": 1}, {"error": "formula failed"}, {"score": 3}]
+    source = spark.createDataFrame(
+        [(index, "original", json.dumps(response)) for index, response in enumerate(responses)],
+        ["source.id", "score", "response"],
+    )
+    schema = StructType([StructField("score", LongType())]) if typed else None
+    before = time.time()
+    result = apply(
+        source,
+        "decision",
+        **api.options,
+        version="3",
+        input_columns=["response"],
+        output_schema=schema,
+        response_options=ResponseOptions(
+            result_format="auto" if typed else "json",
+            raw_column="raw",
+        ),
+    )
+    assert api.requests == []
+    rows = result.collect()
+    assert len(api.requests) == 1
+    assert [r.rulebricks_meta.status for r in rows] == ["ok", "error", "ok"]
+    assert [r["source.id"] for r in rows] == [0, 1, 2]
+    assert all(r.score == "original" for r in rows)
+    assert rows[1].rulebricks_result is None
+    assert rows[1].rulebricks_meta.error.asDict() == {
+        "type": "execution",
+        "message": "formula failed",
+        "http_status": 200,
+    }
+    assert [json.loads(r.raw) for r in rows] == responses
+    assert (
+        rows[2].rulebricks_result.score if typed else json.loads(rows[2].rulebricks_result)["score"]
+    ) == 3
+    meta = rows[2].rulebricks_meta
+    assert (meta.slug, meta.version, meta.attempts, meta.trace_id) == (
+        "decision",
+        "3",
+        1,
+        "trace-123",
+    )
+    assert before <= meta.started_at.timestamp() <= meta.completed_at.timestamp() <= time.time()
+    assert meta.execution_id == (ROOT_ID if apply == apply_flow else None)
+    assert meta.item_execution_id == (
+        str(uuid.uuid5(uuid.UUID(ROOT_ID), "2")) if apply == apply_flow else None
+    )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_payload_shaping_limits_and_correlation(spark, api):
+    source = spark.createDataFrame(
+        [(i, "é" * 10, "unused") for i in range(5)], ["id", "text", "audit"]
+    )
+    rows = apply_flow(
+        source,
+        "decision",
+        **api.options,
+        input_columns=["id", "text"],
+        input_mapping={"id": "customer"},
+        correlation_id_path="customer",
+        max_batch_rows=2,
+        max_batch_bytes=90,
+    ).collect()
+    assert [r.rulebricks_meta.correlation_id for r in rows] == [str(i) for i in range(5)]
+    assert all(r.audit == "unused" for r in rows)
+    assert all(len(request.content) <= 90 for request in api.requests)
+    assert all(len(json.loads(request.content)) <= 2 for request in api.requests)
+    assert [item for request in api.requests for item in json.loads(request.content)] == [
+        {"customer": i, "text": "é" * 10} for i in range(5)
+    ]
+    api.requests.clear()
+    source = spark.createDataFrame(
+        [('{"customer":{"id":"a"}}',), ("not JSON",), ('{"customer":{"id":"c"}}',)], ["body"]
+    )
+    rows = apply_flow(
+        source, "decision", **api.options, payload_column="body", correlation_id_path="customer.id"
+    ).collect()
+    assert [r.rulebricks_meta.status for r in rows] == ["ok", "error", "ok"]
+    assert rows[2].rulebricks_meta.correlation_id == "c"
+    assert sum(len(json.loads(request.content)) for request in api.requests) == 2
 
-class TestSolveEndToEnd:
-    def test_basic_solve_returns_expected_columns(self, spark, rule_schema):
-        from rulebricks_spark import solve
 
-        df = spark.createDataFrame(
+def test_custom_responses_and_schema_drift(spark, api):
+    responses = [
+        {"data": [1, 2], "extra": True},
+        {"failure": {"message": "bad input"}},
+        {"data": ["changed"]},
+        {"unexpected": True},
+        {"data": []},
+    ]
+    source = spark.createDataFrame([(json.dumps(item),) for item in responses], ["response"])
+    rows = apply_flow(
+        source,
+        "decision",
+        **api.options,
+        output_schema=ArrayType(LongType()),
+        response_options=ResponseOptions(
+            error_handler=business_error, transform=unwrap, raw_column="raw"
+        ),
+    ).collect()
+    assert len(api.requests) == 1
+    assert [r.rulebricks_meta.error.type if r.rulebricks_meta.error else None for r in rows] == [
+        None,
+        "execution",
+        "schema",
+        "response_handler",
+        None,
+    ]
+    assert rows[0].rulebricks_result == [1, 2] and rows[4].rulebricks_result == []
+    assert "$[0]" in rows[2].rulebricks_meta.error.message
+    assert [json.loads(r.raw) for r in rows] == responses
+    row = apply_flow(
+        source.limit(1),
+        "decision",
+        **api.options,
+        output_schema=StructType([StructField("data", LongType())]),
+        response_options=ResponseOptions(schema_mismatch="null"),
+    ).collect()[0]
+    assert row.rulebricks_result.data is None and row.rulebricks_meta.status == "ok"
+
+
+def test_arrow_preserves_nullable_ids_decimals_and_timestamps(spark, api):
+    decimal = Decimal("123456789012345678901234567890123456.78")
+    source = spark.createDataFrame(
+        [
+            (9007199254740993, str(decimal), '{"tier":"3"}'),
+            (None, None, "{}"),
+        ],
+        StructType(
             [
-                ("R1", 500_000, False),
-                ("R2", 2_000_000, True),
-                ("R3", 1_500_000, True),
-            ],
-            schema=["report_id", "financial_impact", "customer_harm"],
+                StructField("id", LongType()),
+                StructField("amount", StringType()),
+                StructField("attributes", StringType()),
+            ]
+        ),
+    )
+    source = source.withColumn(
+        "attributes", functions.from_json("attributes", MapType(StringType(), StringType()))
+    )
+    schema = StructType(
+        [
+            StructField("id", LongType()),
+            StructField("amount", DecimalType(38, 2)),
+            StructField("attributes", MapType(StringType(), LongType())),
+        ]
+    )
+    previous = spark.conf.get("spark.sql.session.timeZone")
+    spark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+    try:
+        source = source.withColumn(
+            "event_at", functions.expr("TIMESTAMP_NTZ '2026-01-15 12:00:00'")
         )
-
-        result = solve(
-            df,
-            rule="breach-triage",
-            api_key="test-key",
-            output_schema=rule_schema,
-            batch_size=10,
-            _client_class=FakeClient,
-        )
-
-        rows = result.orderBy("report_id").collect()
-        assert [r.report_id for r in rows] == ["R1", "R2", "R3"]
-        assert [r.priority for r in rows] == ["P3", "P1", "P1"]
-        assert [r.reportable for r in rows] == [False, True, True]
-        assert [r._rb_error for r in rows] == [None, None, None]
-
-    def test_rb_error_column_null_on_success(self, spark, rule_schema):
-        from rulebricks_spark import solve
-
-        df = spark.createDataFrame(
-            [("R1", 1_000_000, True)],
-            schema=["report_id", "financial_impact", "customer_harm"],
-        )
-        result = solve(
-            df, rule="triage", api_key="k",
-            output_schema=rule_schema,
-            _client_class=FakeClient,
-        )
-        assert all(r._rb_error is None for r in result.collect())
-
-    def test_batching_handles_all_rows(self, spark, rule_schema):
-        """Verify all 25 rows are processed correctly regardless of batch chunking."""
-        from rulebricks_spark import solve
-
-        df = spark.createDataFrame(
-            [("R" + str(i), i * 100_000, i % 2 == 0) for i in range(25)],
-            schema=["report_id", "financial_impact", "customer_harm"],
-        ).repartition(1)
-
-        result = solve(
-            df,
-            rule="triage",
-            api_key="k",
-            output_schema=rule_schema,
-            batch_size=10,
-            max_concurrent_requests_per_partition=1,
-            _client_class=FakeClient,
-        )
-
-        rows = result.collect()
-        # All 25 rows processed with no errors.
-        assert len(rows) == 25
-        assert all(r._rb_error is None for r in rows)
-        assert all(r.priority in ("P1", "P3") for r in rows)
-
-    def test_collision_overwrite_default(self, spark, rule_schema):
-        """If input has a 'priority' column, rule output replaces it."""
-        from rulebricks_spark import solve
-
-        df = spark.createDataFrame(
-            [("R1", 2_000_000, True, "UNKNOWN")],
-            schema=["report_id", "financial_impact", "customer_harm", "priority"],
-        )
-        result = solve(
-            df, rule="triage", api_key="k",
-            output_schema=rule_schema,
-            _client_class=FakeClient,
-        )
-        row = result.collect()[0]
-        assert row.priority == "P1"  # Rule output, not the stale "UNKNOWN".
-
-    def test_collision_error_raises(self, spark, rule_schema):
-        from rulebricks_spark import solve
-        from rulebricks_spark.exceptions import SchemaConflictError
-
-        df = spark.createDataFrame(
-            [("R1", 1_000_000, True, "UNKNOWN")],
-            schema=["report_id", "financial_impact", "customer_harm", "priority"],
-        )
-        with pytest.raises(SchemaConflictError, match="priority"):
-            solve(
-                df,
-                rule="triage",
-                api_key="k",
-                output_schema=rule_schema,
-                on_conflict="error",
-                _client_class=FakeClient,
-            )
-
-    def test_input_mapping_renames_fields(self, spark, rule_schema):
-        from rulebricks_spark import solve
-
-        df = spark.createDataFrame(
-            [("R1", 2_000_000, True)],
-            schema=["report_id", "fin_impact", "harm"],
-        )
-        result = solve(
-            df,
-            rule="triage",
-            api_key="k",
-            output_schema=rule_schema,
-            input_mapping={"fin_impact": "financial_impact", "harm": "customer_harm"},
-            _client_class=FakeClient,
-        )
-        row = result.collect()[0]
-        assert row.priority == "P1"
-
-    def test_invalid_input_mapping_raises(self, spark, rule_schema):
-        from rulebricks_spark import solve
-
-        df = spark.createDataFrame([("R1",)], schema=["report_id"])
-        with pytest.raises(ValueError, match="input_mapping"):
-            solve(
-                df,
-                rule="triage",
-                api_key="k",
-                output_schema=rule_schema,
-                input_mapping={"nonexistent_column": "something"},
-                _client_class=FakeClient,
-            )
+        rows = apply_rule(source, "decision", **api.options, output_schema=schema).collect()
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", previous)
+    assert rows[0].id == rows[0].rulebricks_result.id == 9007199254740993
+    assert rows[1].id is None and rows[1].rulebricks_result.id is None
+    assert rows[0].rulebricks_result.amount == decimal
+    assert rows[0].rulebricks_result.attributes == {"tier": 3}
+    payloads = json.loads(api.requests[0].content)
+    assert payloads[0]["id"] == 9007199254740993 and payloads[1]["id"] is None
+    assert payloads[0]["event_at"] == "2026-01-15T12:00:00"
 
 
-class TestErrorHandling:
-    def test_bulk_solve_failure_continues(self, spark, rule_schema):
-        """With on_error='continue', batch failures populate _rb_error."""
-        from rulebricks_spark import solve
+def test_resume_reads_saved_contract_and_only_reexecutes_selected_rows(spark, api, tmp_path):
+    responses = ResponseOptions(error_handler=business_error, transform=unwrap, raw_column="raw")
+    headers = {"additional_headers": {"X-Workload": "nightly"}}
+    api.handler = lambda request: (
+        httpx.Response(503, text="unavailable")
+        if json.loads(request.content)[0]["id"] == 1
+        else httpx.Response(200, json=[{"data": {"score": 0}}])
+    )
+    source = spark.createDataFrame([(0,), (1,)], StructType([StructField("id", LongType(), False)]))
+    first = apply_flow(
+        source,
+        "decision",
+        **api.options,
+        version="3",
+        max_batch_rows=1,
+        max_retries=0,
+        output_schema=StructType([StructField("score", LongType(), False)]),
+        response_options=responses,
+        request_options=headers,
+        diagnostics=True,
+    )
+    path = str(tmp_path / "run")
+    first.write.parquet(path)
+    restored = spark.read.parquet(path).withColumn("audit_batch", functions.lit(12))
+    assert "nightly" not in json.dumps(restored.schema.jsonValue())
+    with pytest.raises(ValueError, match="callbacks"):
+        resume(restored, **api.options)
+    with pytest.raises(ValueError, match="request_options"):
+        resume(restored, **api.options, response_options=responses)
+    api.requests.clear()
+    api.handler = lambda request: httpx.Response(200, json=[{"data": {"score": 1}}])
+    rows = sorted(
+        resume(
+            restored, **api.options, response_options=responses, request_options=headers
+        ).collect(),
+        key=lambda r: r.id,
+    )
+    assert len(api.requests) == 1 and json.loads(api.requests[0].content) == [{"id": 1}]
+    assert api.requests[0].headers["X-Workload"] == "nightly"
+    assert [r.rulebricks_result.score for r in rows] == [0, 1]
+    assert [r.rulebricks_meta.attempts for r in rows] == [1, 2]
+    assert all(r.audit_batch == 12 for r in rows)
+    assert json.loads(rows[1].raw) == {"data": {"score": 1}}
+    assert rows[1].rulebricks_meta.diagnostics.attempt_history[0].http_status == 503
 
-        df = spark.createDataFrame(
-            [("R1", 1, False), ("R2", 2, True)],
-            schema=["report_id", "financial_impact", "customer_harm"],
-        )
-        result = solve(
-            df,
-            rule="triage",
-            api_key="k",
-            output_schema=rule_schema,
-            on_error="continue",
-            max_retries=0,
-            _client_class=FailingClient,
-        )
-        rows = result.collect()
-        assert all(r._rb_error is not None for r in rows)
-        assert all("simulated API failure" in r._rb_error for r in rows)
-        assert all(r.priority is None for r in rows)
+
+def test_resume_rejects_replayable_lineage_and_changed_contracts(spark, api):
+    api.handler = lambda request: httpx.Response(503, text="unavailable")
+    pending = apply_flow(spark.range(1), "decision", **api.options, max_retries=0).cache()
+    try:
+        with pytest.raises(ValueError, match="cache"):
+            resume(pending, **api.options)
+        assert api.requests == []
+    finally:
+        pending.unpersist()
+    first = pending.checkpoint(eager=True)
+    second = apply_flow(spark.range(1), "decision", **api.options, max_retries=0).checkpoint(
+        eager=True
+    )
+    with pytest.raises(ValueError, match="different executions"):
+        resume(first.unionByName(second), **api.options)
+    with pytest.raises(ValueError, match="types no longer match"):
+        resume(first.withColumn("id", functions.col("id").cast("string")), **api.options)
+    api.handler = echo
+    row = resume(first, **api.options).collect()[0]
+    assert row.rulebricks_meta.status == "ok" and row.rulebricks_meta.attempts == 2
+
+
+def test_sql_registration_and_nullable_output(spark, api):
+    register_udf(
+        spark,
+        "decide",
+        "decision",
+        **api.options,
+        output_schema=StructType([StructField("id", LongType())]),
+        max_batch_rows=2,
+    )
+    source = spark.createDataFrame(
+        [('{"id":9007199254740993}',), ('{"error":"failed"}',)], ["response"]
+    )
+    rows = source.selectExpr("decide(struct(*)) AS result").collect()
+    assert rows[0].result.id == 9007199254740993
+    assert rows[1].result.id is None and rows[1].result._rb_error == "failed"
+    source = spark.createDataFrame(
+        [(9007199254740993,), (None,)], StructType([StructField("id", LongType())])
+    ).coalesce(1)
+    rows = source.selectExpr("decide(struct(*)) AS result").collect()
+    assert "cannot guarantee precision" in rows[0].result._rb_error
+
+
+def test_invalid_configuration_fails_before_requests(spark, api):
+    source = spark.createDataFrame([(1, 2)], ["a", "odd`name"])
+    for options, message in [
+        ({"input_mapping": {"a": "odd`name"}}, "destination"),
+        ({"result_column": "a"}, "already exist"),
+        ({"request_options": {"additional_body_parameters": {}}}, "Unsupported"),
+        ({"max_batch_rows": 0}, "max_batch_rows"),
+        ({"output_schema": LongType()}, "output_schema"),
+    ]:
+        with pytest.raises((TypeError, ValueError), match=message):
+            apply_flow(source, "decision", **api.options, **options)
+    assert api.requests == []
+    result = apply_flow(source.repartition(4), "decision", **api.options, execution_partitions=2)
+    assert result.rdd.getNumPartitions() == 2
+    assert result.collect()[0]["odd`name"] == 2

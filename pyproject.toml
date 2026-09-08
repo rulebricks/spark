@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "rulebricks-spark"
 dynamic = ["version"]
-description = "Apache Spark integration for Rulebricks — apply decision-table based rules to Spark DataFrames at scale."
+description = "A Rulebricks decision-based data processing client for Apache Spark."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -22,7 +22,6 @@ keywords = [
     "business-rules",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -31,14 +30,16 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "rulebricks>=1.0.0",
-    "pyspark>=3.3",
-    "pandas>=1.5",
-    "pyarrow>=10.0",
+    "rulebricks>=2.6.8,<3",
+    "httpx>=0.28,<1",
+    "pyspark>=3.5,<3.6",
+    "pandas>=2,<3",
+    "pyarrow>=18,<26",
 ]
 
 [project.optional-dependencies]
@@ -48,15 +49,16 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.0",
     "build>=1.0",
-    "twine>=4.0",
+    "twine>=7.0",
+    "nbformat>=5.10",
+    "validate-pyproject>=0.23",
 ]
 
 [project.urls]
 Homepage = "https://rulebricks.com"
-Documentation = "https://rulebricks.com/docs"
+Documentation = "https://github.com/rulebricks/spark#readme"
 Repository = "https://github.com/rulebricks/spark"
 Issues = "https://github.com/rulebricks/spark/issues"
-Changelog = "https://github.com/rulebricks/spark/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/rulebricks_spark/_version.py"
@@ -69,11 +71,13 @@ include = [
     "src/rulebricks_spark",
     "tests",
     "examples",
+    "docs",
+    "scripts",
     "assets",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
     "pyproject.toml",
+    ".readthedocs.yaml",
 ]
 
 [tool.pytest.ini_options]
@@ -89,9 +93,12 @@ markers = [
 line-length = 100
 target-version = "py39"
 
+[tool.ruff.format]
+line-ending = "lf"
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N"]
-ignore = ["E501"]
+ignore = ["E501", "UP006", "UP035", "UP045"]
 
 [tool.mypy]
 python_version = "3.9"

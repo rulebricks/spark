@@ -12,6 +12,7 @@ build/
 .ruff_cache/
 .tox/
 .venv/
+.venv-docs/
 venv/
 *.so
 .DS_Store
@@ -19,3 +20,5 @@ venv/
 *.swo
 
 demo/
+docs/_build/
+docs/_notebooks/
