@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/rulebricks-spark.svg)](https://pypi.org/project/rulebricks-spark/)
 
 
-![Reference Documentation](https://rulebricks-spark.readthedocs.io](https://rulebricks-spark.readthedocs.io/en/latest/)
+![Reference Documentation](https://rulebricks-spark.readthedocs.io/en/latest/)
 
 Apply versioned Rulebricks rules and flows to PySpark DataFrames. The library
 sends records in bounded requests and keeps each decision, error, and execution
