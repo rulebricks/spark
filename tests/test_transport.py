@@ -7,7 +7,12 @@ import pytest
 from rulebricks.core.api_error import ApiError
 
 from rulebricks_spark import _transport
-from rulebricks_spark._transport import classify_exception, run_attempt
+from rulebricks_spark._transport import (
+    _split_request_options,
+    classify_exception,
+    run_attempt,
+    sdk_client,
+)
 from tests.conftest import ROOT_ID
 
 
@@ -70,6 +75,33 @@ def test_sdk_options_disable_hidden_retries(config, sdk, asset_type):
     assert request.headers["X-Workload"] == "nightly" and request.url.params["region"] == "west"
     assert set(request.extensions["timeout"].values()) == {12.5}
     assert "max_retries" not in config.request_options
+
+
+def test_verify_option_configures_httpx_and_is_not_forwarded(config, monkeypatch):
+    client_type = httpx.Client
+    client_options = []
+
+    def capture_client(**kwargs):
+        client_options.append(dict(kwargs))
+        return client_type(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[{}])),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(_transport.httpx, "Client", capture_client)
+    config.request_options = {
+        "verify": False,
+        "additional_headers": {"X-Workload": "development"},
+    }
+    verify, forwarded = _split_request_options(config.request_options)
+
+    with sdk_client(config) as client:
+        result = run_attempt(client, config, [{}])
+
+    assert verify is False and "verify" not in forwarded
+    assert client_options[0]["verify"] is False
+    assert result.data == [{}]
+    assert config.request_options["verify"] is False
 
 
 @pytest.mark.parametrize(

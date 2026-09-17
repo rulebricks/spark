@@ -94,8 +94,9 @@ def apply_rule(
         Raw JSON, schema mismatch handling, original responses, and executor
         callbacks. See :class:`rulebricks_spark.ResponseOptions`.
     request_options:
-        SDK additional_headers and additional_query_parameters. Credentials
-        and request options are never stored in result schema metadata.
+        SDK additional_headers and additional_query_parameters, plus the Spark
+        transport's boolean verify setting for TLS certificates. Credentials and
+        request options are never stored in result schema metadata.
     isolate_failures:
         Bisect failed HTTP 500 requests after retries. Disable for flows whose
         side effects make additional executions undesirable.

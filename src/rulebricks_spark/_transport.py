@@ -6,7 +6,7 @@ import datetime
 import email.utils
 import math
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -44,10 +44,26 @@ class FailureInfo:
     retryable: bool
 
 
+def _split_request_options(
+    request_options: Optional[Mapping[str, Any]],
+) -> tuple[bool, Dict[str, Any]]:
+    """Separate Spark transport settings from generated SDK request options."""
+    if request_options is not None and not isinstance(request_options, Mapping):
+        raise TypeError("request_options must be a mapping or None.")
+    sdk_options = dict(request_options or {})
+    verify = sdk_options.pop("verify", True)
+    if not isinstance(verify, bool):
+        raise TypeError("request_options.verify must be a bool.")
+    return verify, sdk_options
+
+
 @contextmanager
 def sdk_client(config: RunConfig) -> Iterator[Rulebricks]:
     """Own the HTTP connection pool for one Spark task."""
-    with httpx.Client(timeout=config.timeout_seconds, follow_redirects=True) as http_client:
+    verify, _ = _split_request_options(config.request_options)
+    with httpx.Client(
+        timeout=config.timeout_seconds, follow_redirects=True, verify=verify
+    ) as http_client:
         yield Rulebricks(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -61,7 +77,7 @@ def run_attempt(client: Any, config: RunConfig, payloads: List[Dict[str, Any]]) 
     """Execute one bulk request, preserving its original JSON and trace headers."""
 
     started_at = _utcnow()
-    request_options = dict(config.request_options)
+    _, request_options = _split_request_options(config.request_options)
     request_options.update(max_retries=0, timeout_in_seconds=config.timeout_seconds)
     if config.context_operation:
         from .contexts import _context_attempt

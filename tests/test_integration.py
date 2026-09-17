@@ -390,12 +390,19 @@ def test_invalid_configuration_fails_before_requests(spark, api):
         ({"input_mapping": {"a": "odd`name"}}, "destination"),
         ({"result_column": "a"}, "already exist"),
         ({"request_options": {"additional_body_parameters": {}}}, "Unsupported"),
+        ({"request_options": {"verify": "false"}}, "request_options.verify"),
         ({"max_batch_rows": 0}, "max_batch_rows"),
         ({"output_schema": LongType()}, "output_schema"),
     ]:
         with pytest.raises((TypeError, ValueError), match=message):
             apply_flow(source, "decision", **api.options, **options)
     assert api.requests == []
-    result = apply_flow(source.repartition(4), "decision", **api.options, execution_partitions=2)
+    result = apply_flow(
+        source.repartition(4),
+        "decision",
+        **api.options,
+        execution_partitions=2,
+        request_options={"verify": False},
+    )
     assert result.rdd.getNumPartitions() == 2
     assert result.collect()[0]["odd`name"] == 2

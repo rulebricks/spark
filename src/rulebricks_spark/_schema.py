@@ -24,6 +24,7 @@ from pyspark.sql.types import (
 from rulebricks import Rulebricks
 from rulebricks.core.request_options import RequestOptions
 
+from ._transport import _split_request_options
 from .exceptions import SchemaInferenceError
 
 # Complex types have no nested schema in the listing; retain them as JSON.
@@ -60,12 +61,12 @@ def _load_asset(
     """Load one published rule or flow and its selected-version schemas on the driver."""
     if asset_type not in ("rule", "flow"):
         raise ValueError("asset_type must be 'rule' or 'flow'.")
-    options = dict(request_options or {})
+    verify, options = _split_request_options(request_options)
     queries = options.get("additional_query_parameters", {})
     if set(queries) & {"slug", "id", "version", "search", "name", "folder", "labels", "user_group"}:
         raise ValueError("request_options cannot override asset schema filters.")
     try:
-        with httpx.Client(timeout=timeout_seconds) as http_client:
+        with httpx.Client(timeout=timeout_seconds, verify=verify) as http_client:
             client = Rulebricks(
                 api_key=api_key,
                 base_url=base_url,

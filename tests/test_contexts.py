@@ -218,9 +218,17 @@ def test_context_rejects_oversize_record_before_writing(spark, api):
     assert rows[0].rulebricks_meta.correlation_id == str(2**53 + 1)
 
 
-def test_setup_creates_reuses_and_rejects_conflicting_definitions(spark, api):
+def test_setup_creates_reuses_and_rejects_conflicting_definitions(spark, api, monkeypatch):
 
     definitions = []
+    client_type = httpx.Client
+    client_options = []
+
+    def capture_client(**kwargs):
+        client_options.append(dict(kwargs))
+        return client_type(**kwargs)
+
+    monkeypatch.setattr(contexts.httpx, "Client", capture_client)
 
     def setup(request):
         if request.method == "POST":
@@ -238,17 +246,19 @@ def test_setup_creates_reuses_and_rejects_conflicting_definitions(spark, api):
 
     api.handler = setup
     source = spark.createDataFrame([("a", 1)], ["id", "balance"])
-    slug = contexts.ensure("Customer state", schema=source.schema, key="id", **api.options)
+    options = {**api.options, "request_options": {"verify": False}}
+    slug = contexts.ensure("Customer state", schema=source.schema, key="id", **options)
     assert slug == "customer-actual"
-    assert contexts.ensure("Customer state", schema=source.schema, key="id", **api.options) == slug
+    assert contexts.ensure("Customer state", schema=source.schema, key="id", **options) == slug
     assert sum(r.method == "POST" for r in api.requests) == 1
     definitions[0]["schema"]["base"][1]["type"] = "string"
     with pytest.raises(ValueError, match=r"schema.base.balance"):
-        contexts.ensure("Customer state", schema=source.schema, key="id", **api.options)
+        contexts.ensure("Customer state", schema=source.schema, key="id", **options)
     definitions.append(dict(definitions[0], id="other"))
     with pytest.raises(ValueError, match="Multiple contexts"):
-        contexts.ensure("Customer state", schema=source.schema, key="id", **api.options)
+        contexts.ensure("Customer state", schema=source.schema, key="id", **options)
     assert sum(r.method == "POST" for r in api.requests) == 1
+    assert all(options["verify"] is False for options in client_options)
 
 
 def test_setup_checks_all_name_matches_before_creating(api):

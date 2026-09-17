@@ -24,7 +24,7 @@ identity fact in that definition. The return value is the server-assigned slug.
 | `ttl_seconds` | `86400` | Instance retention in seconds |
 | `history_limit` | `100` | Fact-history retention count |
 | `timeout_seconds` | `300` | Timeout for setup requests |
-| `request_options` | None | Additional headers; query and body overrides are rejected |
+| `request_options` | None | Additional headers and TLS `verify`; query and body overrides are rejected |
 
 Existing definitions must match the requested settings and fields; additional
 facts are allowed. Ambiguous names or incompatible definitions raise an error
@@ -129,8 +129,9 @@ original values. The state view reads caller storage rather than live Contexts.
 All DataFrame context operations require `api_key` and `base_url`, and accept
 `timeout_seconds=300`, `result_column="rulebricks_result"`,
 `metadata_column="rulebricks_meta"`, and `request_options=None`. Custom output
-names must be new and distinct. Headers and extra queries follow the SDK; the
-library retains control over alignment, retries, and required response fields.
+names must be new and distinct. Headers and extra queries follow the SDK; `verify`
+controls TLS certificate verification. The library retains control over alignment,
+retries, and required response fields.
 
 Source keys must be strings or integers. Null and empty identities become local
 errors; ingestion and ordered processing reject numeric identities outside JSON's

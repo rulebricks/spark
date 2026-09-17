@@ -95,7 +95,7 @@ def resume(
         raise ValueError("response_options no longer match the execution contract.")
     if contract.get("request_options_required") and not request_options:
         raise ValueError(
-            "resume() requires the original request_options; headers are not stored in table metadata."
+            "resume() requires the original request_options; they are not stored in table metadata."
         )
     if isinstance(error_types, (str, bytes)):
         raise TypeError("error_types must be a sequence of error category names.")

@@ -21,6 +21,7 @@ from pyspark.sql.types import StringType
 from ._apply import CONTRACT_METADATA_KEY, apply_dataframe, literal_column
 from ._payload import context_instance_key
 from ._schema import _data_type_from_json
+from ._transport import _split_request_options
 from .exceptions import ExecutionError
 from .responses import ResponseOptions
 
@@ -153,11 +154,12 @@ def _require_session(spark):
 
 def _definition(checkpoint, args):
     """Read the declared Context via existing admin APIs, without SDK type coercion."""
+    verify, _ = _split_request_options(args.get("request_options"))
     headers = {
         "x-api-key": args["api_key"],
         **(args.get("request_options") or {}).get("additional_headers", {}),
     }
-    with httpx.Client(timeout=args["timeout_seconds"], headers=headers) as client:
+    with httpx.Client(timeout=args["timeout_seconds"], headers=headers, verify=verify) as client:
         endpoint = args["base_url"].rstrip("/") + "/admin/contexts"
         cursor, matched = None, None
         while True:

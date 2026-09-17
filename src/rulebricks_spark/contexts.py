@@ -40,7 +40,13 @@ from ._apply import (
 )
 from ._checkpoints import Checkpoint
 from ._config import RunConfig
-from ._transport import BulkResponse, _utcnow, classify_exception, error_message
+from ._transport import (
+    BulkResponse,
+    _split_request_options,
+    _utcnow,
+    classify_exception,
+    error_message,
+)
 from .responses import ResponseOptions
 
 __all__ = ["ensure", "ingest", "lookup", "apply_flow", "Checkpoint"]
@@ -103,7 +109,7 @@ def ensure(
         raise ValueError("key must name a string or number base fact in schema.")
     if len({field["key"] for field in base_fields}) != len(base_fields):
         raise ValueError("Context schema contains duplicate base facts.")
-    options = dict(request_options or {})
+    verify, options = _split_request_options(request_options)
     if options.get("additional_query_parameters") or options.get("additional_body_parameters"):
         raise ValueError("request_options cannot override context setup fields or filters.")
     options.update(max_retries=0, timeout_in_seconds=timeout_seconds)
@@ -114,7 +120,7 @@ def ensure(
         history_limit=history_limit,
         on_schema_mismatch="reject",
     )
-    with httpx.Client(timeout=timeout_seconds) as http_client:
+    with httpx.Client(timeout=timeout_seconds, verify=verify) as http_client:
         client = Rulebricks(
             api_key=api_key,
             base_url=base_url,

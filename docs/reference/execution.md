@@ -43,7 +43,7 @@ are returned as data.
 | `diagnostics` | `False` | Include chunk identity, size, and attempt history |
 | `on_error` | `"continue"` | Return failures as rows, or `"raise"` to fail the task |
 | `response_options` | Default `ResponseOptions` | JSON format, raw retention, callbacks, and conversion policy |
-| `request_options` | None | SDK additional headers and query parameters |
+| `request_options` | None | SDK headers/query parameters and Spark TLS `verify` setting |
 | `isolate_failures` | `True` | Allow bounded HTTP 500 bisection after retries; 413 size splitting remains enabled |
 | `input_validation` | `"none"` | `"strict"` or `"warn"` checks declared input paths and compatible Spark types |
 

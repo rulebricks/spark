@@ -79,18 +79,25 @@ of the HTTP response.
 ## Customize requests
 
 The execution functions accept `request_options` separately from response options.
-They support the SDK's `additional_headers` and `additional_query_parameters`.
-Body overrides are rejected because they could invalidate alignment and byte
-limits. The library retains control of timeouts and retries.
+They support the SDK's `additional_headers` and `additional_query_parameters`,
+plus the Spark transport option `verify`. Body overrides are rejected because
+they could invalidate alignment and byte limits. The library retains control of
+timeouts and retries.
 
 ```python
 request_options = {
     "additional_headers": {"X-Workload": "nightly-order-decisions"},
+    "verify": False,
 }
 ```
+
+`verify` defaults to `True`. Setting it to `False` disables TLS certificate and
+hostname verification for driver-side schema or context requests and executor-side
+execution requests. Use it only for isolated development systems; configuring a
+trusted CA through `SSL_CERT_FILE` is safer for private production endpoints.
 
 Headers also apply to schema lookups when those are needed. Query parameters cannot
 override the asset filters used for a schema lookup. For an API key without admin
 read access, supply an explicit output schema or use JSON with input preflight off.
-Request headers are not stored in output metadata and must be supplied again for
+Request options are not stored in output metadata and must be supplied again for
 recovery. A static request header is not a per-record idempotency key.

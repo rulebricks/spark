@@ -22,6 +22,7 @@ from ._config import RunConfig
 from ._engine import make_partition_worker
 from ._metadata import RB_PREFIX, build_execution_schema
 from ._schema import _load_asset, _rule_output_schema, _validate_input_schema
+from ._transport import _split_request_options
 from .responses import ResponseOptions
 
 DEFAULT_MAX_BATCH_BYTES = 5 * 1024 * 1024
@@ -90,14 +91,14 @@ def apply_dataframe(
         raise TypeError("response_options must be ResponseOptions or None.")
     if responses.result_format == "json" and output_schema is not None:
         raise ValueError("output_schema cannot be combined with result_format='json'.")
-    if request_options is not None and not isinstance(request_options, Mapping):
-        raise TypeError("request_options must be a mapping or None.")
-    unsupported = set(request_options or {}) - {"additional_headers", "additional_query_parameters"}
+    _, sdk_request_options = _split_request_options(request_options)
+    unsupported = set(sdk_request_options) - {
+        "additional_headers",
+        "additional_query_parameters",
+    }
     if unsupported:
         raise ValueError("Unsupported request_options: " + ", ".join(sorted(unsupported)))
-    if request_options and any(
-        not isinstance(value, Mapping) for value in request_options.values()
-    ):
+    if any(not isinstance(value, Mapping) for value in sdk_request_options.values()):
         raise TypeError("Each request_options value must be a mapping.")
     if context_operation and "include" in (request_options or {}).get(
         "additional_query_parameters", {}
