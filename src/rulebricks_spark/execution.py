@@ -9,6 +9,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql.types import DataType
 
 from ._apply import (
+    DEFAULT_EXECUTION_PARTITIONS,
     DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_BATCH_ROWS,
     DEFAULT_MAX_RETRIES,
@@ -31,7 +32,8 @@ def apply_rule(
     correlation_id_path: Optional[str] = None,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
-    execution_partitions: Optional[int] = 1,
+    execution_partitions: Optional[int] = DEFAULT_EXECUTION_PARTITIONS,
+    max_inflight_rows: Optional[int] = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_schema: Optional[DataType] = None,
@@ -71,11 +73,32 @@ def apply_rule(
     correlation_id_path:
         Dot path copied from the payload into metadata for correlation.
     max_batch_bytes:
-        Maximum encoded request body size.
+        Maximum encoded request body size; defaults to 64 MiB. Server limits
+        still apply. Automatic mode may choose smaller requests.
     max_batch_rows:
-        Maximum rows in one Rulebricks request.
+        Maximum rows in one request. Without max_inflight_rows, omission keeps
+        the legacy 1,000-row ceiling. With a row budget, omission enables
+        automatic tuning; explicitly supplying a value selects manual batching
+        without automatic tuning. None explicitly uses the 10,000-row safety cap.
+        Byte limits, remaining allowances, and partition tails can shorten batches.
     execution_partitions:
-        Spark partitions used for execution. One request is active per task.
+        Optional Spark producer override. With a row budget, omission derives
+        partitioning from the request plan, aiming for four overlapping requests
+        per task within Spark default parallelism. Without a budget, omission
+        keeps one partition. None preserves source partitions. An explicit or
+        preserved count must not exceed the row budget; too many producers can
+        require smaller batches. This argument alone does not disable tuning.
+    max_inflight_rows:
+        Optional positive planned row allowance across this execution. Omit
+        max_batch_rows to tune batching automatically, or supply it to use a
+        measured batch size. Both modes refill individual completed requests
+        immediately and retain allowances through retries and splitting.
+        Fixed per-partition allowances are not transferred when tasks finish.
+        Each task uses at most 32 request threads. Actual concurrency depends
+        on scheduled tasks and available input; task retries and remote work
+        surviving timeouts can exceed the plan. Only independent rows are
+        supported. Results can arrive out of order while source/result alignment
+        is preserved. None retains one request at a time per Spark task.
     max_retries:
         Inline retries for transient request failures.
     timeout_seconds:
@@ -120,6 +143,7 @@ def apply_rule(
         max_batch_bytes=max_batch_bytes,
         max_batch_rows=max_batch_rows,
         execution_partitions=execution_partitions,
+        max_inflight_rows=max_inflight_rows,
         max_retries=max_retries,
         timeout_seconds=timeout_seconds,
         output_schema=output_schema,
@@ -147,7 +171,8 @@ def apply_flow(
     correlation_id_path: Optional[str] = None,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
-    execution_partitions: Optional[int] = 1,
+    execution_partitions: Optional[int] = DEFAULT_EXECUTION_PARTITIONS,
+    max_inflight_rows: Optional[int] = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     output_schema: Optional[DataType] = None,
@@ -163,8 +188,10 @@ def apply_flow(
     """Apply a flow, preserving source columns and appending results and metadata.
 
     Results are JSON unless ``output_schema`` is supplied. All other options
-    match :func:`apply_rule`. Execution is lazy, with one active HTTP request
-    per Spark task.
+    match :func:`apply_rule`. Execution is lazy. max_inflight_rows enables
+    bounded row admission for independent inputs. Omitting max_batch_rows enables
+    automatic tuning; supplying it selects manual batching. Without a row budget,
+    each Spark task sends one request at a time.
     """
 
     return apply_dataframe(
@@ -181,6 +208,7 @@ def apply_flow(
         max_batch_bytes=max_batch_bytes,
         max_batch_rows=max_batch_rows,
         execution_partitions=execution_partitions,
+        max_inflight_rows=max_inflight_rows,
         max_retries=max_retries,
         timeout_seconds=timeout_seconds,
         output_schema=output_schema,

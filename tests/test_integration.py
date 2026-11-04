@@ -1,6 +1,7 @@
 """Public API through Spark workers, the generated SDK, and a local HTTP server."""
 
 import json
+import threading
 import time
 import uuid
 from decimal import Decimal
@@ -340,6 +341,63 @@ def test_resume_preserves_payload_column_and_only_retries_failures(
     assert [row.rulebricks_meta.attempts for row in rows] == [1, 2]
 
 
+@pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
+def test_resume_concurrent_failures_preserves_successes_and_history(
+    spark, api, tmp_path, batch_options
+):
+    api.handler = lambda request: (
+        httpx.Response(503, text="unavailable")
+        if json.loads(request.content)[0]["id"] < 8
+        else echo(request)
+    )
+    path = str(tmp_path / "concurrent-recovery")
+    apply_flow(
+        spark.range(12, numPartitions=2),
+        "decision",
+        **api.options,
+        max_inflight_rows=4,
+        **batch_options,
+        max_retries=0,
+        diagnostics=True,
+    ).write.parquet(path)
+    saved = spark.read.parquet(path)
+    initial = {row.id: row for row in saved.collect()}
+    api.requests.clear()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+
+    def recover(request):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 4:
+                release.set()
+        try:
+            assert release.wait(10)
+            return echo(request)
+        finally:
+            with lock:
+                active -= 1
+
+    api.handler = recover
+    rows = resume(saved, **api.options, max_inflight_rows=4, **batch_options).collect()
+
+    assert peak == 4
+    assert sorted(json.loads(r.content)[0]["id"] for r in api.requests) == list(range(8))
+    assert sorted(row.id for row in rows) == list(range(12))
+    for row in rows:
+        assert row.rulebricks_meta.status == "ok"
+        assert json.loads(row.rulebricks_result) == {"id": row.id}
+        assert row.rulebricks_meta.operation_id == initial[row.id].rulebricks_meta.operation_id
+        if row.id < 8:
+            assert row.rulebricks_meta.attempts == 2
+            assert row.rulebricks_meta.diagnostics.attempt_history[0].http_status == 503
+        else:
+            assert row == initial[row.id]
+
+
 def test_resume_rejects_replayable_lineage_and_changed_contracts(spark, api):
     api.handler = lambda request: httpx.Response(503, text="unavailable")
     pending = apply_flow(spark.range(1), "decision", **api.options, max_retries=0).cache()
@@ -392,6 +450,11 @@ def test_invalid_configuration_fails_before_requests(spark, api):
         ({"request_options": {"additional_body_parameters": {}}}, "Unsupported"),
         ({"request_options": {"verify": "false"}}, "request_options.verify"),
         ({"max_batch_rows": 0}, "max_batch_rows"),
+        ({"max_inflight_rows": 0}, "max_inflight_rows"),
+        ({"max_inflight_rows": True}, "max_inflight_rows"),
+        ({"max_inflight_rows": 1.5}, "max_inflight_rows"),
+        ({"max_inflight_rows": 1, "execution_partitions": 2}, "partition count"),
+        ({"max_inflight_rows": 1, "execution_partitions": None}, "partition count"),
         ({"output_schema": LongType()}, "output_schema"),
     ]:
         with pytest.raises((TypeError, ValueError), match=message):
@@ -406,3 +469,308 @@ def test_invalid_configuration_fails_before_requests(spark, api):
     )
     assert result.rdd.getNumPartitions() == 2
     assert result.collect()[0]["odd`name"] == 2
+
+
+@pytest.mark.parametrize("apply", [apply_flow, apply_rule])
+@pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
+def test_row_budget_runs_multiple_requests_in_one_spark_task(spark, api, apply, batch_options):
+    first_started = threading.Event()
+    replacement_started = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def handler(request):
+        nonlocal active, peak
+        item = json.loads(request.content)[0]["id"]
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if item == 0:
+                first_started.set()
+                assert replacement_started.wait(10)
+            elif item == 1:
+                assert first_started.wait(10)
+            elif item == 2:
+                replacement_started.set()
+            return echo(request)
+        finally:
+            with lock:
+                active -= 1
+
+    api.handler = handler
+    result = apply(
+        spark.range(12, numPartitions=1),
+        "decision",
+        **api.options,
+        execution_partitions=1,
+        max_inflight_rows=2,
+        **batch_options,
+        response_options=ResponseOptions(result_format="json"),
+    )
+    assert api.requests == [] and result.rdd.getNumPartitions() == 1
+    rows = sorted(result.collect(), key=lambda row: row.id)
+    assert peak == 2 and replacement_started.is_set()
+    assert [row.id for row in rows] == list(range(12))
+    assert all(json.loads(row.rulebricks_result) == {"id": row.id} for row in rows)
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+
+
+@pytest.mark.parametrize(
+    "options,partitions,allowances,tuning",
+    [
+        ({}, 1, [None], False),
+        ({"execution_partitions": None}, 3, [None, None, None], False),
+        ({"max_batch_rows": 2}, 1, [None], False),
+        ({"max_batch_rows": None}, 1, [None], False),
+        ({"max_inflight_rows": 5}, 1, [5], True),
+        ({"max_inflight_rows": 1}, 1, [1], True),
+        ({"max_inflight_rows": 5, "execution_partitions": 1}, 1, [5], True),
+        ({"max_inflight_rows": 5, "execution_partitions": None}, 3, [2, 2, 1], True),
+        ({"max_inflight_rows": 5, "max_batch_rows": 1000}, 1, [5], False),
+        ({"max_inflight_rows": 5, "max_batch_rows": None}, 1, [5], False),
+        ({"max_inflight_rows": 128, "max_batch_rows": 4}, 2, [64, 64], False),
+        ({"max_inflight_rows": 128, "max_batch_rows": 32}, 1, [128], False),
+        ({"max_inflight_rows": 128, "max_batch_rows": 64}, 1, [128], False),
+        (
+            {"max_inflight_rows": 5, "max_batch_rows": 4, "execution_partitions": 3},
+            3,
+            [2, 2, 1],
+            False,
+        ),
+    ],
+)
+def test_request_planning_and_legacy_defaults(
+    spark, api, monkeypatch, options, partitions, allowances, tuning
+):
+    from rulebricks_spark import _apply
+
+    configs = []
+    original = _apply.make_partition_worker
+
+    def capture(config, *args, **kwargs):
+        configs.append(config)
+        return original(config, *args, **kwargs)
+
+    monkeypatch.setattr(_apply, "make_partition_worker", capture)
+    result = apply_flow(spark.range(12, numPartitions=3), "decision", **api.options, **options)
+    assert result.rdd.getNumPartitions() == partitions
+    assert [configs[0].row_budget(i) for i in range(partitions)] == allowances
+    assert configs[0].tunes_batches is tuning
+    assert api.requests == []
+    rows = result.collect()
+    assert sorted(row.id for row in rows) == list(range(12))
+    assert all(json.loads(row.rulebricks_result)["id"] == row.id for row in rows)
+    ceiling = min(options.get("max_batch_rows", 1000) or 10000, 10000)
+    assert all(len(json.loads(request.content)) <= ceiling for request in api.requests)
+
+
+@pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
+def test_row_budget_with_empty_source_and_preserved_partitioning(spark, api, batch_options):
+    source = spark.createDataFrame(spark.sparkContext.emptyRDD(), "id long")
+    assert source.rdd.getNumPartitions() == 0
+    result = apply_flow(
+        source,
+        "decision",
+        **api.options,
+        max_inflight_rows=4,
+        execution_partitions=None,
+        **batch_options,
+    )
+    assert result.collect() == [] and api.requests == []
+
+
+@pytest.mark.parametrize("downstream", ["union", "coalesce", "union_coalesce"])
+@pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
+def test_row_budget_preserves_input_partition_budget_under_downstream_operators(
+    spark, api, downstream, batch_options
+):
+    result = apply_flow(
+        spark.range(12, numPartitions=2),
+        "decision",
+        **api.options,
+        execution_partitions=2,
+        max_inflight_rows=5,
+        **batch_options,
+    )
+    if "union" in downstream:
+        prefix = spark.createDataFrame([], result.schema)
+        result = prefix.unionByName(result)
+    if "coalesce" in downstream:
+        result = result.coalesce(1)
+    rows = result.collect()
+    assert sorted(row.id for row in rows) == list(range(12))
+    assert len(api.requests) == 12
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+    assert all(json.loads(row.rulebricks_result) == {"id": row.id} for row in rows)
+
+
+@pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
+def test_concurrent_spark_timeout_infrastructure_and_terminal_errors(spark, api, batch_options):
+    attempts = {}
+    lock = threading.Lock()
+    release_first = threading.Event()
+
+    def handler(request):
+        item = json.loads(request.content)[0]["id"]
+        with lock:
+            attempts[item] = attempts.get(item, 0) + 1
+            attempt = attempts[item]
+        if item == 0 and attempt == 1:
+            assert release_first.wait(10)
+        elif item == 0:
+            release_first.set()
+        if item == 1 and attempt == 1:
+            return httpx.Response(503, text="temporarily unavailable", headers={"Retry-After": "0"})
+        if item == 2:
+            return httpx.Response(504, text="upstream timeout", headers={"Retry-After": "0"})
+        if item == 3:
+            return httpx.Response(401, text="unauthorized")
+        return echo(request)
+
+    api.handler = handler
+    try:
+        collected = apply_flow(
+            spark.range(12, numPartitions=2),
+            "decision",
+            **api.options,
+            execution_partitions=2,
+            max_inflight_rows=4,
+            **batch_options,
+            max_retries=1,
+            timeout_seconds=1.0,
+            diagnostics=True,
+        ).collect()
+    finally:
+        release_first.set()
+    rows = {row.id: row for row in collected}
+    assert len(collected) == len(rows) == 12
+    assert attempts == {i: 2 if i in (0, 1, 2) else 1 for i in range(12)}
+    assert rows[0].rulebricks_meta.diagnostics.attempt_history[0].error_type == "network"
+    assert rows[1].rulebricks_meta.diagnostics.attempt_history[0].http_status == 503
+    assert rows[2].rulebricks_meta.error.type == "infrastructure"
+    assert rows[2].rulebricks_meta.error.http_status == 504
+    assert rows[3].rulebricks_meta.error.type == "client"
+    for i in range(12):
+        if i not in (2, 3):
+            assert rows[i].rulebricks_meta.status == "ok"
+            assert json.loads(rows[i].rulebricks_result) == {"id": i}
+
+
+def test_row_budget_keeps_batching_room_on_a_wide_spark_cluster(spark, api, monkeypatch):
+    from pyspark import SparkContext
+
+    monkeypatch.setattr(SparkContext, "defaultParallelism", property(lambda self: 64))
+    result = apply_flow(
+        spark.range(12, numPartitions=2), "decision", **api.options, max_inflight_rows=128
+    )
+    assert result.rdd.getNumPartitions() == 8
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("batch_rows,partitions", [(4, 8), (16, 2), (32, 1), (64, 1)])
+def test_manual_partition_count_follows_the_request_plan(
+    spark, api, monkeypatch, batch_rows, partitions
+):
+    from pyspark import SparkContext
+
+    monkeypatch.setattr(SparkContext, "defaultParallelism", property(lambda self: 64))
+    result = apply_flow(
+        spark.range(512, numPartitions=partitions),
+        "decision",
+        **api.options,
+        max_inflight_rows=128,
+        max_batch_rows=batch_rows,
+    )
+    assert result.rdd.getNumPartitions() == partitions
+    assert api.requests == []
+    rows = result.collect()
+    assert sorted(row.id for row in rows) == list(range(512))
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+    assert [len(json.loads(r.content)) for r in api.requests] == [batch_rows] * (512 // batch_rows)
+
+
+def test_adaptive_batching_reaches_spark_tasks_and_respects_the_row_budget(spark, api):
+    lock = threading.Lock()
+    active = peak = 0
+    sizes = set()
+
+    def handler(request):
+        nonlocal active, peak
+        size = len(json.loads(request.content))
+        with lock:
+            sizes.add(size)
+            active += size
+            peak = max(peak, active)
+        try:
+            time.sleep(0.04 if size == 8 else 0.005)
+            return echo(request)
+        finally:
+            with lock:
+                active -= size
+
+    api.handler = handler
+    rows = apply_flow(
+        spark.range(512, numPartitions=1),
+        "decision",
+        **api.options,
+        max_inflight_rows=16,
+        execution_partitions=1,
+    ).collect()
+    assert sorted(row.id for row in rows) == list(range(512))
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+    assert 8 in sizes and 4 in sizes
+    assert peak <= 16
+
+
+@pytest.mark.parametrize("apply", [apply_flow, apply_rule])
+def test_manual_batching_reaches_spark_tasks(spark, api, apply):
+    rows = apply(
+        spark.range(512, numPartitions=1),
+        "decision",
+        **api.options,
+        max_inflight_rows=16,
+        execution_partitions=1,
+        max_batch_rows=8,
+        response_options=ResponseOptions(result_format="json"),
+    ).collect()
+    assert sorted(row.id for row in rows) == list(range(512))
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+    assert [len(json.loads(r.content)) for r in api.requests] == [8] * 64
+
+
+def test_resume_uses_a_fresh_manual_batch_plan(spark, api, tmp_path):
+    api.handler = lambda request: (
+        httpx.Response(503, text="unavailable")
+        if json.loads(request.content)[0]["id"] < 8
+        else echo(request)
+    )
+    path = str(tmp_path / "manual-recovery")
+    apply_flow(
+        spark.range(12, numPartitions=1),
+        "decision",
+        **api.options,
+        max_inflight_rows=4,
+        max_batch_rows=1,
+        max_retries=0,
+    ).write.parquet(path)
+    saved = spark.read.parquet(path)
+    initial = {row.id: row for row in saved.collect()}
+    api.requests.clear()
+    api.handler = echo
+    rows = resume(
+        saved,
+        **api.options,
+        max_inflight_rows=8,
+        max_batch_rows=4,
+        execution_partitions=1,
+    ).collect()
+    assert sorted(row.id for row in rows) == list(range(12))
+    assert [len(json.loads(r.content)) for r in api.requests] == [4, 4]
+    for row in rows:
+        assert row.rulebricks_meta.status == "ok"
+        if row.id >= 8:
+            assert row == initial[row.id]
+        else:
+            assert row.rulebricks_meta.attempts == 2

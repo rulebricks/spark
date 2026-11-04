@@ -5,10 +5,13 @@ from __future__ import annotations
 import datetime
 import json
 import random
+import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any, Dict, List, Optional
 
 from ._config import RunConfig
@@ -106,7 +109,13 @@ class ByteChunker:
         return [records]
 
 
-def make_partition_worker(config: RunConfig, input_names: Sequence[str], output_schema):
+def make_partition_worker(
+    config: RunConfig,
+    input_names: Sequence[str],
+    output_schema,
+    *,
+    partition_id_column: Optional[str] = None,
+):
     """Use Arrow directly so nullable int64 values never pass through floats."""
 
     def worker(batch_iter) -> Iterator[Any]:
@@ -119,10 +128,35 @@ def make_partition_worker(config: RunConfig, input_names: Sequence[str], output_
                 "Spark retried a stateful task. Stop this attempt; resume its checkpoint path if configured, otherwise reconcile state before replaying."
             )
         arrow_schema = to_arrow_schema(output_schema)
-        chunker = ByteChunker(config.max_batch_bytes, min(config.max_batch_rows or 10000, 10000))
         source_columns = [name for name in input_names if not name.startswith(RB_PREFIX)]
         blocked = False
         blocked_key = None
+
+        if partition_id_column is not None:
+            # Empty partitions require neither a request budget nor an HTTP client.
+            first = next((batch for batch in batch_iter if batch.num_rows), None)
+            if first is None:
+                return
+            partition_id = first.column(partition_id_column)[0].as_py()
+            batch_iter = chain([first], batch_iter)
+            del first
+        else:
+            partition_id = task.partitionId() if task is not None else 0
+        slots = config.request_slots(partition_id)
+        row_budget = config.row_budget(partition_id)
+        if row_budget is not None:
+            if config.state_key is not None or config.context_operation is not None:
+                raise ExecutionError("Concurrent requests require independent rule or flow rows.")
+            from ._adaptive import RecordStream, row_budget_outcomes
+
+            stream = RecordStream(batch_iter, config, input_names, row_budget)
+            outcomes_iter = row_budget_outcomes(stream, config, slots, row_budget=row_budget)
+            try:
+                for outcomes in outcomes_iter:
+                    yield _outcomes_to_arrow(outcomes, config, source_columns, arrow_schema)
+            finally:
+                outcomes_iter.close()
+            return
 
         def emit(chunk):
             nonlocal blocked, blocked_key
@@ -165,33 +199,35 @@ def make_partition_worker(config: RunConfig, input_names: Sequence[str], output_
             return _outcomes_to_arrow(outcomes, config, source_columns, arrow_schema)
 
         with sdk_client(config) as client:
-            for batch in batch_iter:
-                # Spark owns the incoming Arrow batch. Bound only our decoded
-                # Python copy, independently of the HTTP byte budget.
-                for offset in range(0, batch.num_rows, 1000):
-                    rows = batch.slice(offset, 1000).to_pylist(maps_as_pydicts="strict")
-                    for values in rows:
-                        source = dict(zip(input_names, values.values()))
-                        try:
-                            record = _make_record(source, config)
-                        except Exception as exc:
-                            for chunk in chunker.finish():
-                                yield emit(chunk)
-                            outcome = _local_payload_failure(source, exc, config)
-                            if config.state_key is not None:
-                                blocked_key = source.get(config.state_key)
-                            if config.on_error == "raise":
-                                raise ExecutionError(outcome.metadata["_rb_error"]) from exc
-                            yield _outcomes_to_arrow(
-                                [outcome], config, source_columns, arrow_schema
-                            )
-                            continue
-                        for chunk in chunker.add(record):
-                            yield emit(chunk)
-            for chunk in chunker.finish():
-                yield emit(chunk)
+            for item in _prepare_chunks(batch_iter, config, input_names):
+                if isinstance(item, RowOutcome):
+                    if config.state_key is not None:
+                        blocked_key = item.record.source.get(config.state_key)
+                    if config.on_error == "raise":
+                        raise ExecutionError(item.metadata["_rb_error"])
+                    yield _outcomes_to_arrow([item], config, source_columns, arrow_schema)
+                else:
+                    yield emit(item)
 
     return worker
+
+
+def _prepare_chunks(batch_iter, config: RunConfig, input_names: Sequence[str]):
+    """Read Arrow only on the task thread, with bounded decoded input."""
+    chunker = ByteChunker(config.max_batch_bytes, min(config.max_batch_rows or 10000, 10000))
+    for batch in batch_iter:
+        for offset in range(0, batch.num_rows, 1000):
+            rows = batch.slice(offset, 1000).to_pylist(maps_as_pydicts="strict")
+            for values in rows:
+                source = dict(zip(input_names, values.values()))
+                try:
+                    record = _make_record(source, config)
+                except Exception as exc:
+                    yield from chunker.finish()
+                    yield _local_payload_failure(source, exc, config)
+                    continue
+                yield from chunker.add(record)
+    yield from chunker.finish()
 
 
 def _make_record(source: Dict[str, Any], config: RunConfig) -> RecordState:
@@ -244,6 +280,7 @@ def _execute_chunk(
     _retry_limit: Optional[int] = None,
     _depth: int = 0,
     _exhausted_failure: Optional[FailureInfo] = None,
+    _cancelled: Optional[threading.Event] = None,
 ) -> List[RowOutcome]:
     """Execute, retry, and if needed recursively split one chunk."""
 
@@ -251,6 +288,8 @@ def _execute_chunk(
     retry_limit = config.max_retries if _retry_limit is None else _retry_limit
 
     for retry_index in range(retry_limit + 1):
+        if _cancelled is not None and _cancelled.is_set():
+            raise CancelledError()
         if not budget.consume():
             failure = _exhausted_failure or FailureInfo(
                 error_type="unknown",
@@ -282,7 +321,11 @@ def _execute_chunk(
             size_error = failure.error_type in ("payload_too_large", "response_too_large")
             if not size_error and failure.retryable and retry_index < retry_limit:
                 _append_failure_history(records, failure, chunk_id, failed_completed)
-                time.sleep(_retry_delay(failure, retry_index))
+                delay = _retry_delay(failure, retry_index)
+                if _cancelled is None:
+                    time.sleep(delay)
+                elif _cancelled.wait(delay):
+                    raise CancelledError() from None
                 continue
 
             if can_split and (
@@ -301,6 +344,7 @@ def _execute_chunk(
                             _retry_limit=max(0, retry_limit - retry_index) if size_error else 0,
                             _depth=_depth + 1,
                             _exhausted_failure=failure,
+                            _cancelled=_cancelled,
                         )
                     )
                 return outcomes

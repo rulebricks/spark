@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import uuid
 from collections.abc import Mapping, Sequence
@@ -18,17 +19,28 @@ from pyspark.sql.types import (
     StructType,
 )
 
-from ._config import RunConfig
+from ._config import DEFAULT_MAX_BATCH_BYTES as DEFAULT_MAX_BATCH_BYTES
+from ._config import DEFAULT_MAX_BATCH_ROWS as DEFAULT_MAX_BATCH_ROWS
+from ._config import RunConfig, initial_batch_rows
 from ._engine import make_partition_worker
 from ._metadata import RB_PREFIX, build_execution_schema
 from ._schema import _load_asset, _rule_output_schema, _validate_input_schema
 from ._transport import _split_request_options
 from .responses import ResponseOptions
 
-DEFAULT_MAX_BATCH_BYTES = 5 * 1024 * 1024
-DEFAULT_MAX_BATCH_ROWS = 1000
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_RETRIES = 3
+
+
+class _DefaultExecutionPartitions(int):
+    """Distinguish an omitted partition count from an explicit 1.
+
+    The int value preserves the public signature's historical default. Only
+    callers opting into a concurrency budget get automatic partition planning.
+    """
+
+
+DEFAULT_EXECUTION_PARTITIONS = _DefaultExecutionPartitions(1)
 
 CONTRACT_METADATA_KEY = "rulebricks_contract"
 
@@ -79,6 +91,7 @@ def apply_dataframe(
     context_key: Optional[str] = None,
     context_namespace: Optional[str] = None,
     contract: Optional[Dict[str, Any]] = None,
+    max_inflight_rows: Optional[int] = None,
 ) -> DataFrame:
     """Prepare and return one lazy Rulebricks DataFrame transformation."""
 
@@ -187,12 +200,19 @@ def apply_dataframe(
         ("max_batch_bytes", max_batch_bytes, 3),
         ("max_batch_rows", max_batch_rows, 1),
         ("execution_partitions", execution_partitions, 1),
+        ("max_inflight_rows", max_inflight_rows, 1),
         ("max_retries", max_retries, 0),
     ):
-        if number is None and name in ("max_batch_rows", "execution_partitions"):
+        if number is None and name in (
+            "max_batch_rows",
+            "execution_partitions",
+            "max_inflight_rows",
+        ):
             continue
         if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}.")
+    if max_inflight_rows is not None and (state_key is not None or context_operation is not None):
+        raise ValueError("max_inflight_rows is only supported for independent rule and flow rows.")
     if (
         not isinstance(timeout_seconds, (int, float))
         or isinstance(timeout_seconds, bool)
@@ -218,6 +238,11 @@ def apply_dataframe(
         if duplicates:
             raise ValueError("output_schema contains duplicate fields: " + ", ".join(duplicates))
 
+    partitioned = (
+        plan_execution(df, execution_partitions, max_inflight_rows, max_batch_rows)
+        if max_inflight_rows is not None
+        else None
+    )
     source_columns = [
         name for name in df.columns if not (contract is not None and name.startswith(RB_PREFIX))
     ]
@@ -277,6 +302,11 @@ def apply_dataframe(
         "request_options_required": bool(request_options),
     }
 
+    if partitioned is None:
+        partitioned = apply_partitioning(df, execution_partitions)
+    planned_partitions = (
+        partitioned.rdd.getNumPartitions() if max_inflight_rows is not None else None
+    )
     config = RunConfig(
         asset_type=asset_type,
         slug=slug,
@@ -303,9 +333,10 @@ def apply_dataframe(
         state_key=state_key,
         context_key=context_key,
         context_namespace=context_namespace,
+        max_inflight_rows=max_inflight_rows,
+        execution_partitions=planned_partitions,
     )
 
-    partitioned = apply_partitioning(df, execution_partitions)
     worker_schema = build_execution_schema(
         partitioned.schema,
         output_schema=output_schema,
@@ -318,8 +349,17 @@ def apply_dataframe(
             for index, name in enumerate(partitioned.columns)
         ]
     )
+    partition_id_column = None
+    if max_inflight_rows is not None:
+        # Downstream unions/coalesces can give TaskContext a different partition
+        # ID. Capture the input partition index before entering the Arrow worker.
+        partition_id_column = "_rb_request_partition"
+        safe_input = safe_input.withColumn(partition_id_column, functions.spark_partition_id())
     internal = safe_input.mapInArrow(
-        make_partition_worker(config, partitioned.columns, worker_schema), schema=worker_schema
+        make_partition_worker(
+            config, partitioned.columns, worker_schema, partition_id_column=partition_id_column
+        ),
+        schema=worker_schema,
     )
     return project_result(
         internal,
@@ -412,6 +452,50 @@ def project_result(
         metadata,
         *([functions.col("_rb_raw_result").alias(raw_column)] if raw_column else []),
     )
+
+
+def plan_execution(
+    df: DataFrame,
+    execution_partitions: Optional[int],
+    max_inflight_rows: Optional[int],
+    max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
+) -> DataFrame:
+    """Distribute a request plan across producers without a coordinator."""
+    if max_inflight_rows is None:
+        return apply_partitioning(df, execution_partitions)
+    if df.isStreaming:
+        raise ValueError("Use max_inflight_rows inside foreachBatch, not on a streaming DataFrame.")
+    batch_rows = initial_batch_rows(max_batch_rows, max_inflight_rows)
+    full_requests, remainder = divmod(max_inflight_rows, batch_rows)
+    requests = full_requests + bool(remainder)
+    if isinstance(execution_partitions, _DefaultExecutionPartitions):
+        # Aim for four overlapping requests per producer. Never create a
+        # producer just for the partial slot: it would have a tiny allowance
+        # but still receive a whole Spark input partition.
+        execution_partitions = min(
+            max(1, (requests + 3) // 4),
+            max(1, full_requests),
+            max(1, df.sparkSession.sparkContext.defaultParallelism),
+        )
+    if execution_partitions is None:
+        execution_partitions = df.rdd.getNumPartitions()
+        if execution_partitions == 0:
+            return df
+    if execution_partitions > max_inflight_rows:
+        raise ValueError(
+            "max_inflight_rows must be >= the execution partition count. "
+            "Set execution_partitions <= max_inflight_rows or omit it for automatic planning."
+        )
+    partitioned = apply_partitioning(df, execution_partitions)
+    logging.getLogger(__name__).info(
+        "Rulebricks request plan: %s rows total; initial batch ceiling=%s; "
+        "%s nominal requests; %s execution partitions",
+        max_inflight_rows,
+        batch_rows,
+        requests,
+        execution_partitions,
+    )
+    return partitioned
 
 
 def apply_partitioning(df: DataFrame, execution_partitions: Optional[int]) -> DataFrame:

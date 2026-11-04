@@ -10,6 +10,7 @@ from pyspark.sql.types import StringType, StructType
 
 from ._apply import (
     CONTRACT_METADATA_KEY,
+    DEFAULT_EXECUTION_PARTITIONS,
     DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_BATCH_ROWS,
     DEFAULT_MAX_RETRIES,
@@ -30,7 +31,8 @@ def resume(
     error_types: Optional[Sequence[str]] = None,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
-    execution_partitions: Optional[int] = 1,
+    execution_partitions: Optional[int] = DEFAULT_EXECUTION_PARTITIONS,
+    max_inflight_rows: Optional[int] = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     on_error: str = "continue",
@@ -45,7 +47,10 @@ def resume(
 
     error_types defaults to transient request failures. Re-supply response
     callbacks and request_options if the original run used them; neither is
-    stored in table metadata. Request limits and on_error match apply_rule().
+    stored in table metadata. Request limits, max_inflight_rows, partition
+    planning, and on_error match apply_rule(). A row budget with omitted
+    max_batch_rows enables tuning; explicit max_batch_rows selects manual
+    batching. This plan is chosen anew, not inherited from the saved operation.
 
     A string path resumes a ``contexts.Checkpoint`` run using its original
     execution settings. It reconstructs plain Context state under fresh instance
@@ -56,6 +61,8 @@ def resume(
     if isinstance(result_df, str):
         from ._checkpoints import resume_checkpoint
 
+        if max_inflight_rows is not None:
+            raise ValueError("max_inflight_rows is not supported for stateful checkpoint recovery.")
         if error_types is not None:
             raise ValueError(
                 "Stateful checkpoint recovery replays whole unfinished windows, not selected error types."
@@ -152,6 +159,7 @@ def resume(
         max_batch_bytes=max_batch_bytes,
         max_batch_rows=max_batch_rows,
         execution_partitions=execution_partitions,
+        max_inflight_rows=max_inflight_rows,
         max_retries=max_retries,
         timeout_seconds=timeout_seconds,
         output_schema=output_schema,

@@ -49,7 +49,7 @@ aligned by the server's explicit positions.
 | `input_mapping` | None | Source-to-context fact names |
 | `order_by` | None | Ascending source columns defining merge order within each key |
 | `execution_partitions` | `1` | Positive partition count; equal keys stay together |
-| `max_batch_bytes`, `max_batch_rows` | 5 MiB, `1000` | Limits per ingestion request |
+| `max_batch_bytes`, `max_batch_rows` | 64 MiB, `1000` | Limits per ingestion request |
 | `include` | None | Additional comma-separated API response fields, such as `state` or `execution_results` |
 
 There are no HTTP retries or failure splits. Individual oversized records become
@@ -93,7 +93,7 @@ not a context write receipt. JSON is the default; `output_schema` and
 `response_options` follow ordinary flow execution semantics.
 
 `version` defaults to `"latest"`, `execution_partitions` to `1`, and
-`max_batch_bytes` to 5 MiB. `input_columns`, `input_mapping`, and
+`max_batch_bytes` to 64 MiB. `input_columns`, `input_mapping`, and
 `correlation_id_path` behave as in bulk execution. Use a separate event correlation
 ID when several events share one state owner. There is no `payload_column` or
 `input_validation` option on this ordered API; prepare and validate the source

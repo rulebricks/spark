@@ -9,8 +9,7 @@
 
 Apply versioned Rulebricks rules and flows to PySpark DataFrames. The library
 sends records in bounded requests and keeps each decision, error, and execution
-ID alongside its source data, so the pipeline can scale without losing the ability
-to explain a run.
+ID alongside its source data.
 
 ```bash
 pip install rulebricks-spark
@@ -26,15 +25,28 @@ results = apply_flow(
     "order-routing-flow",
     version="1",
     api_key=os.environ["RULEBRICKS_API_KEY"],
-    base_url="https://rulebricks.acme.com/api/v1",
+    base_url="https://acme.rulebricks.com/api/v1",
     correlation_id_path="request_id",
-    execution_partitions=4,
+    max_inflight_rows=128,
 )
 results.write.format("delta").mode("errorifexists").save(result_path)
 saved = spark.read.format("delta").load(result_path)
 ```
 
 Flow results remain JSON by default, ready for your own Spark expressions.
+
+For independent rows, `max_inflight_rows=128` lets the library automatically
+pack, overlap, and tune requests within a planned budget of 128 outstanding rows.
+To choose the batch size yourself, set `max_batch_rows`. This disables automatic
+batch tuning. With full batches, the planned number of concurrent requests is
+`max_inflight_rows / max_batch_rows`. In this example, `max_batch_rows=4` gives
+`128 / 4 = 32` requests of four rows each.
+Both modes choose Spark partitioning automatically and refill requests individually.
+`execution_partitions` remains an advanced override; `max_batch_bytes` is a
+64 MiB request ceiling and does not disable tuning. Omitting `max_inflight_rows`
+keeps the existing execution behavior. See
+[execution and scale](docs/execution-model.md#row-budget) for details.
+
 `apply_rule()` uses the same execution model and infers a typed result from the
 selected rule version. Context operations provide optional input staging and
 ordered stateful processing, while Structured Streaming uses Spark's ordinary

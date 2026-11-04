@@ -86,8 +86,12 @@ def api():
             self.send_response(response.status_code)
             for key, value in response.headers.items():
                 self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(response.content)
+            try:
+                self.end_headers()
+                self.wfile.write(response.content)
+            except (BrokenPipeError, ConnectionResetError):
+                # Timeout tests intentionally disconnect before a late response.
+                pass
 
         def log_message(self, *args):
             pass

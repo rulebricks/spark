@@ -18,8 +18,9 @@ credentials are always supplied again by the caller.
 | --- | --- | --- |
 | `api_key`, `base_url` | Required | Execution credentials and API URL |
 | `error_types` | `network`, `infrastructure`, `throttled`, `server` | Categories selected for re-execution |
-| `max_batch_bytes`, `max_batch_rows` | 5 MiB, `1000` | Limits on recovery requests |
-| `execution_partitions` | `1` | Nominal execution partition count |
+| `max_batch_bytes`, `max_batch_rows` | 64 MiB; `1000` or automatic with a row budget | Byte ceiling and optional manual batch ceiling; explicit `None` retains the 10,000-row cap |
+| `execution_partitions` | `1`, or automatic with a budget | Same partition planning as `apply_flow()` |
+| `max_inflight_rows` | `None` | Planned row budget for concurrent recovery. Omit `max_batch_rows` to tune batching or supply it for manual batching; same semantics as `apply_flow()` |
 | `max_retries` | `3` | Inline transient retries after each first attempt |
 | `timeout_seconds` | `300` | Timeout per request |
 | `on_error` | `"continue"` | Return errors as data, or raise from the task |
@@ -30,6 +31,12 @@ The helper validates operation identity and the source schema before submitting
 selected records. It preserves attempt history and appends the new attempts.
 It cannot verify that two Python callbacks from different processes are the same
 implementation, so callers remain responsible for supplying the original logic.
+
+Concurrency is chosen for the recovery execution, independently of the original
+run. For example, `resume(saved, api_key=api_key, base_url=base_url,
+max_inflight_rows=128)` overlaps recovery requests while leaving
+successful rows untouched. See [execution and scale](../execution-model.md#row-budget)
+for how the row budget, batch ceilings, and partition count interact.
 
 When passed a result DataFrame, context writes, ordered stateful runs, mixed
 operations, and incompatible contracts are rejected. An appended streaming table contains several operations and cannot
@@ -45,7 +52,7 @@ Context IDs; successful windows retain their saved results. A completed path
 returns saved results without executing any requests.
 
 Re-supply credentials and any original callbacks or request customization.
-`error_types` is rejected for checkpoint paths, and the per-request tuning arguments
+`error_types` and `max_inflight_rows` are rejected for checkpoint paths, and the per-request tuning arguments
 above apply only to DataFrame recovery. The stateful path uses its original
 configuration and disables HTTP retries. See [Context checkpoints](contexts.md#checkpoint-plain-state)
 for prerequisites and the supported state model.
