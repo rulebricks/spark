@@ -60,3 +60,12 @@ the notebooks, with only credentials kept in a secret manager or environment.
 The package targets classic PySpark 3.5 and requires Python 3.9+ and PyArrow 18+.
 Use a Python version supported by your Spark runtime.
 For a documentation preview, follow [the Sphinx build instructions](docs/contributing.md).
+
+## Releasing
+
+Release versions come from Git tags. Push a tag such as `v0.2.2` (or `0.2.2`)
+on the commit you want to release, and GitHub Actions builds and publishes that
+version to PyPI. There is no version number to edit in the source code.
+
+The release checks the package filenames and metadata against the tag before
+uploading. See [release instructions](docs/contributing.md#releasing) for details.

@@ -1,3 +1,5 @@
-"""Version information for rulebricks-spark."""
+"""Read the version recorded when the package was built or installed."""
 
-__version__ = "0.2.1"
+from importlib.metadata import version
+
+__version__ = version("rulebricks-spark")

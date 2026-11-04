@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs>=0.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -51,6 +51,7 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.0",
     "build>=1.0",
+    "packaging>=23.2",
     "twine>=6.2",
     "nbformat>=5.10",
     "validate-pyproject>=0.23",
@@ -63,7 +64,10 @@ Repository = "https://github.com/rulebricks/spark"
 Issues = "https://github.com/rulebricks/spark/issues"
 
 [tool.hatch.version]
-path = "src/rulebricks_spark/_version.py"
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+dist_name = "rulebricks-spark"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rulebricks_spark"]

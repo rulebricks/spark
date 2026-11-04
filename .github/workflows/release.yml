@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "[0-9]*"
 
 jobs:
   test:
@@ -16,6 +17,8 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,12 +31,18 @@ jobs:
           pip install build "twine>=7"
 
       - name: Build sdist and wheel
-        run: python -m build
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RULEBRICKS_SPARK="${RELEASE_TAG#v}"
+          python -m build
 
       - name: Verify metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python -m twine check dist/*
-          python scripts/check_distribution.py dist/*
+          python scripts/check_distribution.py --expected-version "$RELEASE_TAG" dist/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
