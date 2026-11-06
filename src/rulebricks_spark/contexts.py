@@ -7,7 +7,7 @@ from typing import Any, Optional, cast
 from urllib.parse import quote
 
 import httpx
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Window, functions
 from pyspark.sql.types import (
     ArrayType,
     BooleanType,
@@ -307,7 +307,8 @@ def apply_flow(
     source; ``order_by`` must be unique and non-null within each key.
 
     One event is sent per request by default; ``max_batch_rows`` enables ordered
-    bulk execution. There are no HTTP retries or failure splits. A bulk can have
+    bulk execution. Batches interleave keys while retaining each key's order.
+    There are no HTTP retries or failure splits. A bulk can have
     later committed effects before an earlier item's error is returned.
     A failed event blocks later events for that key; an uncertain request stops
     the partition. Start Spark with speculation disabled, task.maxFailures=1 and
@@ -350,9 +351,14 @@ def apply_flow(
             metadata_column=metadata_column,
             request_options=request_options,
         )
-    ordered = df.repartition(execution_partitions, literal_column(key)).sortWithinPartitions(
-        literal_column(key),
-        *[literal_column(name) for name in order_by],
+    rounds = Window.partitionBy(literal_column(key)).orderBy(
+        *[literal_column(name) for name in order_by]
+    )
+    ordered = (
+        df.repartition(execution_partitions, literal_column(key))
+        .withColumn("_rb_context_round", functions.row_number().over(rounds))
+        .sortWithinPartitions("_rb_context_round", literal_column(key))
+        .drop("_rb_context_round")
     )
     return apply_dataframe(
         ordered,

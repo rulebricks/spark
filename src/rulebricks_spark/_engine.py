@@ -130,7 +130,7 @@ def make_partition_worker(
         arrow_schema = to_arrow_schema(output_schema)
         source_columns = [name for name in input_names if not name.startswith(RB_PREFIX)]
         blocked = False
-        blocked_key = None
+        blocked_keys = set()
 
         if partition_id_column is not None:
             # Empty partitions require neither a request budget nor an HTTP client.
@@ -159,12 +159,30 @@ def make_partition_worker(
             return
 
         def emit(chunk):
-            nonlocal blocked, blocked_key
-            if blocked or (
-                config.state_key is not None and chunk[0].source[config.state_key] == blocked_key
-            ):
-                outcomes = []
-                for record in chunk:
+            nonlocal blocked
+            if config.state_key is None and not blocked:
+                outcomes = _execute_chunk(chunk, client, config)
+                blocked = config.context_operation == "ingest" and any(
+                    outcome.metadata["_rb_error_type"] in ("context_write", "protocol")
+                    for outcome in outcomes
+                )
+                return _outcomes_to_arrow(outcomes, config, source_columns, arrow_schema)
+
+            allowed = [
+                not blocked
+                and (
+                    config.state_key is None or record.source[config.state_key] not in blocked_keys
+                )
+                for record in chunk
+            ]
+            submitted = [record for record, send in zip(chunk, allowed) if send]
+            completed = _execute_chunk(submitted, client, config) if submitted else []
+            results = iter(completed)
+            outcomes = []
+            for record, send in zip(chunk, allowed):
+                if send:
+                    outcomes.append(next(results))
+                else:
                     outcome = _local_payload_failure(
                         record.source,
                         ValueError(
@@ -177,24 +195,27 @@ def make_partition_worker(
                     outcome.metadata["_rb_error_type"] = "context_blocked"
                     outcome.metadata["_rb_record_id"] = record.record_id
                     outcomes.append(outcome)
-            else:
-                outcomes = _execute_chunk(chunk, client, config)
+            if completed:
                 blocked = config.context_operation == "ingest" and any(
                     outcome.metadata["_rb_error_type"] in ("context_write", "protocol")
-                    for outcome in outcomes
+                    for outcome in completed
                 )
                 if config.state_key is not None and any(
-                    outcome.metadata["_rb_status"] != "ok" for outcome in outcomes
+                    outcome.metadata["_rb_status"] != "ok" for outcome in completed
                 ):
-                    blocked_key = chunk[0].source[config.state_key]
+                    blocked_keys.update(
+                        outcome.record.source[config.state_key]
+                        for outcome in completed
+                        if outcome.metadata["_rb_status"] != "ok"
+                    )
                     blocked = any(
                         outcome.metadata["_rb_error_type"]
                         not in ("execution", "schema", "response_handler")
-                        for outcome in outcomes
+                        for outcome in completed
                     )
                     # A bulk response may already contain later committed events.
                     # Stop this partition; a checkpointed caller discards the window.
-                    if len(chunk) > 1:
+                    if len(submitted) > 1:
                         blocked = True
             return _outcomes_to_arrow(outcomes, config, source_columns, arrow_schema)
 
@@ -202,7 +223,7 @@ def make_partition_worker(
             for item in _prepare_chunks(batch_iter, config, input_names):
                 if isinstance(item, RowOutcome):
                     if config.state_key is not None:
-                        blocked_key = item.record.source.get(config.state_key)
+                        blocked_keys.add(item.record.source.get(config.state_key))
                     if config.on_error == "raise":
                         raise ExecutionError(item.metadata["_rb_error"])
                     yield _outcomes_to_arrow([item], config, source_columns, arrow_schema)

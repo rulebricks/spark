@@ -142,6 +142,9 @@ unique, non-null ascending order within each key. An error inside a bulk can be
 reported after later events in that same bulk already ran; the SDK stops the
 remaining partition instead of assuming those events were rolled back.
 
+Batches alternate keys: `A1, B1, C1, A2, B2, C2, ...`. Each key retains its
+`order_by` sequence; independent keys can share a request and run concurrently.
+
 The result is the ordinary flow response, with execution IDs and the requested
 version. It is not a context write receipt and cannot establish which writes
 occurred inside a failed flow. A known event failure blocks later events for that

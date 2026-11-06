@@ -87,6 +87,7 @@ still repeat writes.
 
 The function defaults to one record per request. `max_batch_rows` enables ordered
 bulk requests, with no HTTP retries or failure splitting.
+Batches interleave independent keys while preserving each key's `order_by` sequence.
 A known event failure blocks later events for that key; an uncertain request stops
 the remaining partition. The return value contains normal flow JSON and metadata,
 not a context write receipt. JSON is the default; `output_schema` and

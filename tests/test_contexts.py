@@ -353,3 +353,71 @@ def test_stateful_local_rejection_blocks_later_events_for_that_key(spark, api):
     assert api.requests == []
     assert all(row.rulebricks_meta.attempts == 0 for row in rows)
     assert rows[1].rulebricks_meta.error.type == "context_blocked"
+
+
+def test_stateful_batches_interleave_keys_with_unrelated_order_ranges(spark, api):
+    seen = {}
+
+    def advance(request):
+        events = json.loads(request.content)
+        for event in events:
+            key, sequence = event["account.id"], event["event.sequence"]
+            assert sequence > seen.get(key, -1)
+            seen[key] = sequence
+        return httpx.Response(200, json=[{"sequence": event["event.sequence"]} for event in events])
+
+    api.handler = advance
+    source = spark.createDataFrame(
+        [
+            (key, offset + sequence)
+            for key, offset in [("a", 0), ("b", 100), ("c", 1000)]
+            for sequence in [3, 1, 2]
+        ],
+        ["account.id", "event.sequence"],
+    )
+    rows = contexts.apply_flow(
+        source,
+        "decision",
+        key="account.id",
+        order_by=["event.sequence"],
+        max_batch_rows=3,
+        **api.options,
+    ).collect()
+    assert len(rows) == 9
+    assert all(row.rulebricks_meta.status == "ok" for row in rows)
+    assert all(
+        {event["account.id"] for event in json.loads(request.content)} == {"a", "b", "c"}
+        for request in api.requests
+    )
+    assert set(rows[0].asDict()) == {
+        "account.id",
+        "event.sequence",
+        "rulebricks_result",
+        "rulebricks_meta",
+    }
+
+
+def test_stateful_local_rejection_does_not_submit_key_in_later_mixed_batch(spark, api):
+    def advance(request):
+        events = json.loads(request.content)
+        assert all(event["id"] == "b" for event in events)
+        return httpx.Response(200, json=[{"sequence": event["sequence"]} for event in events])
+
+    api.handler = advance
+    source = spark.createDataFrame(
+        [("a", 1, "x" * 200), ("a", 2, "ok"), ("b", 1, "ok"), ("b", 2, "ok")],
+        ["id", "sequence", "value"],
+    )
+    rows = contexts.apply_flow(
+        source,
+        "decision",
+        key="id",
+        order_by=["sequence"],
+        max_batch_rows=2,
+        max_batch_bytes=128,
+        **api.options,
+    ).collect()
+    by_event = {(row.id, row.sequence): row for row in rows}
+    assert by_event["a", 2].rulebricks_meta.error.type == "context_blocked"
+    assert by_event["a", 2].rulebricks_meta.attempts == 0
+    assert all(by_event["b", seq].rulebricks_meta.status == "ok" for seq in [1, 2])
