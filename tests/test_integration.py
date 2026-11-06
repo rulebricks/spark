@@ -369,8 +369,9 @@ def test_resume_concurrent_failures_preserves_successes_and_history(
 
     def recover(request):
         nonlocal active, peak
+        size = len(json.loads(request.content))
         with lock:
-            active += 1
+            active += size
             peak = max(peak, active)
             if active == 4:
                 release.set()
@@ -379,13 +380,15 @@ def test_resume_concurrent_failures_preserves_successes_and_history(
             return echo(request)
         finally:
             with lock:
-                active -= 1
+                active -= size
 
     api.handler = recover
     rows = resume(saved, **api.options, max_inflight_rows=4, **batch_options).collect()
 
     assert peak == 4
-    assert sorted(json.loads(r.content)[0]["id"] for r in api.requests) == list(range(8))
+    assert sorted(item["id"] for r in api.requests for item in json.loads(r.content)) == list(
+        range(8)
+    )
     assert sorted(row.id for row in rows) == list(range(12))
     for row in rows:
         assert row.rulebricks_meta.status == "ok"
@@ -562,8 +565,9 @@ def test_request_planning_and_legacy_defaults(
     rows = result.collect()
     assert sorted(row.id for row in rows) == list(range(12))
     assert all(json.loads(row.rulebricks_result)["id"] == row.id for row in rows)
-    ceiling = min(options.get("max_batch_rows", 1000) or 10000, 10000)
-    assert all(len(json.loads(request.content)) <= ceiling for request in api.requests)
+    ceiling = options.get("max_batch_rows", options.get("max_inflight_rows", 1000))
+    if ceiling is not None:
+        assert all(len(json.loads(request.content)) <= ceiling for request in api.requests)
 
 
 @pytest.mark.parametrize("batch_options", [{}, {"max_batch_rows": 1}])
@@ -601,7 +605,10 @@ def test_row_budget_preserves_input_partition_budget_under_downstream_operators(
         result = result.coalesce(1)
     rows = result.collect()
     assert sorted(row.id for row in rows) == list(range(12))
-    assert len(api.requests) == 12
+    assert sorted(item["id"] for r in api.requests for item in json.loads(r.content)) == list(
+        range(12)
+    )
+    assert max(len(json.loads(r.content)) for r in api.requests) <= 3
     assert all(row.rulebricks_meta.status == "ok" for row in rows)
     assert all(json.loads(row.rulebricks_result) == {"id": row.id} for row in rows)
 
@@ -691,7 +698,8 @@ def test_manual_partition_count_follows_the_request_plan(
     assert [len(json.loads(r.content)) for r in api.requests] == [batch_rows] * (512 // batch_rows)
 
 
-def test_adaptive_batching_reaches_spark_tasks_and_respects_the_row_budget(spark, api):
+@pytest.mark.parametrize("count", [512, 4096])
+def test_adaptive_batching_reaches_spark_tasks_and_respects_the_row_budget(spark, api, count):
     lock = threading.Lock()
     active = peak = 0
     sizes = set()
@@ -712,15 +720,15 @@ def test_adaptive_batching_reaches_spark_tasks_and_respects_the_row_budget(spark
 
     api.handler = handler
     rows = apply_flow(
-        spark.range(512, numPartitions=1),
+        spark.range(count, numPartitions=1),
         "decision",
         **api.options,
         max_inflight_rows=16,
         execution_partitions=1,
     ).collect()
-    assert sorted(row.id for row in rows) == list(range(512))
+    assert sorted(row.id for row in rows) == list(range(count))
     assert all(row.rulebricks_meta.status == "ok" for row in rows)
-    assert 8 in sizes and 4 in sizes
+    assert 8 in sizes and 16 in sizes
     assert peak <= 16
 
 

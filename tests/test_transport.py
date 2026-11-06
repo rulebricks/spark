@@ -1,6 +1,7 @@
 """SDK response fidelity, error classification, and request options."""
 
 import datetime
+import json
 
 import httpx
 import pytest
@@ -75,6 +76,40 @@ def test_sdk_options_disable_hidden_retries(config, sdk, asset_type):
     assert request.headers["X-Workload"] == "nightly" and request.url.params["region"] == "west"
     assert set(request.extensions["timeout"].values()) == {12.5}
     assert "max_retries" not in config.request_options
+
+
+@pytest.mark.parametrize("asset_type", ["flow", "rule"])
+def test_normalized_bulk_json_has_one_response_decode(config, sdk, asset_type):
+    config.asset_type = asset_type
+    payloads = [{"text": "日本語", "values": [None, False, 0, ""], "large": 9007199254740993}]
+    calls = []
+
+    class Response(httpx.Response):
+        def json(self, **kwargs):
+            calls.append(None)
+            return super().json(**kwargs)
+
+    sdk.handler = lambda request: Response(200, json=payloads)
+    result = run_attempt(sdk.client, config, payloads)
+    assert result.data == payloads
+    assert len(calls) == 1
+    assert json.loads(sdk.requests[0].content) == payloads
+    assert sdk.requests[0].headers["x-api-key"] == config.api_key
+    assert sdk.requests[0].headers["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize("asset_type", ["flow", "rule"])
+def test_bulk_paths_preserve_sdk_escaping(config, sdk, asset_type):
+    config.asset_type = asset_type
+    config.slug = "name with /?#日本語"
+    config.version = "release/1"
+    resource = sdk.client.flows if asset_type == "flow" else sdk.client.rules
+    method = resource.with_raw_response.execute if asset_type == "flow" else resource.with_raw_response.bulk_solve
+    reference = method(config.slug, version=config.version, request=[{}])
+    reference.close()
+    run_attempt(sdk.client, config, [{}])
+    assert sdk.requests[1].url == sdk.requests[0].url
+    assert sdk.requests[1].content == sdk.requests[0].content
 
 
 def test_verify_option_configures_httpx_and_is_not_forwarded(config, monkeypatch):

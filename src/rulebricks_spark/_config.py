@@ -19,8 +19,8 @@ DEFAULT_MAX_BATCH_ROWS = _DefaultBatchRows(1000)
 
 def initial_batch_rows(max_batch_rows: Optional[int], row_budget: int) -> int:
     """Form the request plan before choosing its Spark producers."""
-    rows = 4 if isinstance(max_batch_rows, _DefaultBatchRows) else (max_batch_rows or 10000)
-    return min(rows, 10000, row_budget)
+    rows = 4 if isinstance(max_batch_rows, _DefaultBatchRows) else (max_batch_rows or row_budget)
+    return min(rows, row_budget)
 
 
 @dataclass

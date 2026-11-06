@@ -111,14 +111,39 @@ def test_manual_batches_use_the_callers_ceiling_without_constructing_a_policy(
         ]
     assert sizes == [8] * 16
     assert sorted(row["id"] for row in rows) == list(range(128))
-    assert "adaptive=False" in caplog.text and "probes=0" in caplog.text
+    assert "automatic=False" in caplog.text and "comparisons=0" in caplog.text
+    assert "measurements=" not in caplog.text
     assert all(client.is_closed for client in clients)
 
 
-def test_automatic_requests_keep_the_initial_plan_with_fewer_spark_producers(config, monkeypatch):
-    # A task receiving 64 rows should retain the four-row initial request plan,
-    # rather than growing batches to 16 merely because fewer Spark tasks run.
-    config.max_inflight_rows = 64
+@pytest.mark.parametrize("batch_rows,expected", [(None, [24000]), (20000, [20000, 4000])])
+def test_manual_row_budget_has_no_hidden_batch_row_limit(config, monkeypatch, batch_rows, expected):
+    config.max_inflight_rows = 24000
+    config.max_batch_rows = batch_rows
+    sizes = []
+
+    def handler(request):
+        sizes.append(len(json.loads(request.content)))
+        return echo(request)
+
+    capture_clients(monkeypatch, handler)
+    actual = [
+        r for b in run_partition(config, [{"id": i} for i in range(24000)]) for r in b.to_pylist()
+    ]
+    assert sorted(sizes) == sorted(expected)
+    assert sorted(r["id"] for r in actual) == list(range(24000))
+
+
+@pytest.mark.parametrize("batch_rows,expected", [(None, 24000), (20000, 20000), (50000, 24000)])
+def test_manual_planning_uses_only_the_row_budget_and_supplied_ceiling(batch_rows, expected):
+    from rulebricks_spark._config import initial_batch_rows
+
+    assert initial_batch_rows(batch_rows, 24000) == expected
+
+
+@pytest.mark.parametrize("budget", [16, 64, 1250, 8000, 24000])
+def test_small_payloads_start_packed_instead_of_maximizing_threads(config, monkeypatch, budget):
+    config.max_inflight_rows = budget
     sizes = []
 
     def handler(request):
@@ -128,11 +153,135 @@ def test_automatic_requests_keep_the_initial_plan_with_fewer_spark_producers(con
     capture_clients(monkeypatch, handler)
     rows = [
         row
-        for batch in run_partition(config, [{"id": i} for i in range(64)])
+        for batch in run_partition(config, [{"id": i} for i in range(budget)])
         for row in batch.to_pylist()
     ]
-    assert sizes == [4] * 16
-    assert sorted(row["id"] for row in rows) == list(range(64))
+    base, extra = divmod(budget, 2)
+    assert sorted(sizes) == sorted([base, base + extra])
+    assert sorted(row["id"] for row in rows) == list(range(budget))
+
+
+def test_large_payloads_retain_the_four_request_start(config, monkeypatch):
+    config.max_inflight_rows = 16
+    sizes = []
+
+    def handler(request):
+        sizes.append(len(json.loads(request.content)))
+        return echo(request)
+
+    capture_clients(monkeypatch, handler)
+    inputs = [{"id": i, "data": "x" * 256_000} for i in range(16)]
+    rows = [
+        row
+        for batch in run_partition(config, inputs, names=("id", "data"))
+        for row in batch.to_pylist()
+    ]
+    assert sizes == [4] * 4
+    assert sorted(row["id"] for row in rows) == list(range(16))
+
+
+def test_payload_average_forgets_earlier_sizes_without_counting_prepared_rows_twice(config):
+    from rulebricks_spark._adaptive import RecordStream
+
+    config.max_inflight_rows = 8
+    inputs = [{"text": "x" * size} for size in [2048] * 8 + [15360] * 24]
+    batch = pa.RecordBatch.from_pylist(inputs)
+    stream = RecordStream(iter([batch]), config, ["text"], row_budget=8)
+    first, _, _ = stream.take(8)
+    initial = stream.average_payload_bytes
+    assert stream.observed_rows == 8
+    stream.prepend(first)
+    stream.take(8)
+    assert stream.observed_rows == 8 and stream.average_payload_bytes == initial
+    for _ in range(3):
+        stream.take(8)
+    assert stream.observed_rows == 32
+    assert 14500 < stream.average_payload_bytes < 15400
+
+
+def test_later_larger_payloads_adjust_the_plan_and_keep_actual_byte_limits(config, monkeypatch):
+    from rulebricks_spark import _adaptive
+
+    policies = []
+    original = _adaptive.BatchPolicy
+
+    class CapturedPolicy(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            policies.append(self)
+
+    monkeypatch.setattr(_adaptive, "BatchPolicy", CapturedPolicy)
+    config.max_inflight_rows = 16
+    config.max_batch_bytes = 64 * 1024
+    sent = []
+
+    def handler(request):
+        records = json.loads(request.content)
+        assert len(request.content) <= config.max_batch_bytes
+        sent.extend(r["id"] for r in records)
+        if any(len(r["text"]) == 15360 for r in records):
+            assert len(records) <= 4
+        return echo(request)
+
+    capture_clients(monkeypatch, handler)
+    inputs = [{"id": i, "text": "x" * (2048 if i < 32 else 15360)} for i in range(96)]
+    rows = [
+        row
+        for batch in run_partition(config, inputs, names=("id", "text"))
+        for row in batch.to_pylist()
+    ]
+    assert sorted(r["id"] for r in rows) == sorted(sent) == list(range(96))
+    assert all(r["_rb_status"] == "ok" for r in rows)
+    assert policies[0].minimum_width >= 4
+
+
+def test_changed_payload_mix_reopens_timing_checks_without_needing_a_byte_overflow(
+    config, monkeypatch
+):
+    from rulebricks_spark import _adaptive
+
+    policies = []
+    original = _adaptive.BatchPolicy
+
+    class CapturedPolicy(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            policies.append(self)
+
+    monkeypatch.setattr(_adaptive, "BatchPolicy", CapturedPolicy)
+    config.max_inflight_rows = 16
+    capture_clients(monkeypatch, echo)
+    inputs = [{"id": i, "text": "x" * (2048 if i < 32 else 15360)} for i in range(96)]
+    rows = [r for b in run_partition(config, inputs, ("id", "text")) for r in b.to_pylist()]
+    assert sorted(r["id"] for r in rows) == list(range(96))
+    changes = [e for e in policies[0].events if e.get("event") == "payload_size_changed"]
+    assert 1 <= len(changes) <= 4
+
+
+def test_return_to_smaller_payloads_can_release_an_old_byte_constraint(config, monkeypatch):
+    from rulebricks_spark import _adaptive
+
+    policies = []
+    original = _adaptive.BatchPolicy
+
+    class CapturedPolicy(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            policies.append(self)
+
+    monkeypatch.setattr(_adaptive, "BatchPolicy", CapturedPolicy)
+    config.max_inflight_rows = 16
+    config.max_batch_bytes = 64 * 1024
+
+    def handler(request):
+        assert len(request.content) <= config.max_batch_bytes
+        return echo(request)
+
+    capture_clients(monkeypatch, handler)
+    inputs = [{"id": i, "text": "x" * (15360 if 32 <= i < 96 else 2048)} for i in range(160)]
+    rows = [r for b in run_partition(config, inputs, ("id", "text")) for r in b.to_pylist()]
+    assert sorted(r["id"] for r in rows) == list(range(160))
+    assert policies[0].minimum_width <= 2
 
 
 def test_manual_byte_limited_batches_charge_actual_rows(config, monkeypatch):
@@ -205,7 +354,7 @@ def test_refills_completed_rows_while_a_slow_batch_keeps_its_allowance(
     result = first + [r for batch in iterator for r in batch.to_pylist()]
     assert sorted(r["id"] for r in result) == list(range(31))
     assert sorted(i for ids in seen for i in ids) == list(range(31))
-    assert max(map(len, seen)) <= 3
+    assert max(map(len, seen)) <= (4 if adaptive else 3)
     assert peak == 7
     assert all(client.is_closed for client in clients)
 
@@ -232,7 +381,7 @@ def test_packing_uses_bytes_and_row_ceiling_without_rejecting_large_records(
     actual = [r for batch in run_partition(config, rows, ("id", "text")) for r in batch.to_pylist()]
     assert sorted(r["id"] for r in actual) == list(range(9))
     assert all(r["_rb_status"] == "ok" for r in actual)
-    assert max(map(len, requests)) == (1 if large else (2 if adaptive else 3))
+    assert max(map(len, requests)) == (1 if large else (4 if adaptive else 3))
 
 
 @pytest.mark.parametrize("adaptive", [True, False])
@@ -355,6 +504,7 @@ def test_live_plan_transitions_keep_rows_and_clients_bounded(config, monkeypatch
             policies.append(self)
 
     monkeypatch.setattr(adaptive_engine, "BatchPolicy", FastPolicy)
+    monkeypatch.setattr(adaptive_engine, "initial_requests", lambda *_: 4)
     config.max_inflight_rows = 16
     lock = threading.Lock()
     active = peak = 0
@@ -376,9 +526,9 @@ def test_live_plan_transitions_keep_rows_and_clients_bounded(config, monkeypatch
 
     clients = capture_clients(monkeypatch, handler)
     rows = [
-        r for b in run_partition(config, [{"id": i} for i in range(1024)]) for r in b.to_pylist()
+        r for b in run_partition(config, [{"id": i} for i in range(4096)]) for r in b.to_pylist()
     ]
-    assert sorted(r["id"] for r in rows) == sorted(ids) == list(range(1024))
+    assert sorted(r["id"] for r in rows) == sorted(ids) == list(range(4096))
     assert peak <= 16
     assert len({e["width"] for e in policies[0].events}) >= 2
     assert all(c.is_closed for c in clients)

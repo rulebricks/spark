@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import email.utils
+import json
 import math
 import uuid
 from collections.abc import Iterator, Mapping
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from rulebricks import Rulebricks
 from rulebricks.core.api_error import ApiError
+from rulebricks.core.jsonable_encoder import encode_path_param
 from rulebricks.core.parse_error import ParsingError
 from rulebricks.types.error import Error
 
@@ -83,33 +85,30 @@ def run_attempt(client: Any, config: RunConfig, payloads: List[Dict[str, Any]]) 
         from .contexts import _context_attempt
 
         return _context_attempt(client, config, payloads, request_options, started_at)
+    # Spark's payload builder has already normalized these values to JSON.
+    # Use the SDK's connection/auth/options handling without repeating its
+    # generated request conversion and response union parsing for every item.
+    route = "flows" if config.asset_type == "flow" else "bulk-solve"
+    response = client._client_wrapper.httpx_client.request(
+        f"{route}/{encode_path_param(config.slug)}/{encode_path_param(config.version)}",
+        method="POST",
+        content=json.dumps(
+            payloads, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        request_options=request_options,
+    )
     try:
-        if config.asset_type == "flow":
-            response = client.flows.with_raw_response.execute(
-                config.slug,
-                version=config.version,
-                request=payloads,
-                request_options=request_options,
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+        if not 200 <= response.status_code < 300:
+            raise ApiError(
+                status_code=response.status_code, headers=dict(response.headers), body=body
             )
-        else:
-            response = client.rules.with_raw_response.bulk_solve(
-                config.slug,
-                version=config.version,
-                request=payloads,
-                request_options=request_options,
-            )
-    except (ParsingError, ApiError) as exc:
-        # Generated response types cannot express every valid per-item shape.
-        if exc.status_code is not None and 200 <= exc.status_code < 300:
-            return _attempt_result(
-                exc.body, exc.status_code, httpx.Headers(exc.headers), config, started_at
-            )
-        raise
-
-    try:
-        # Avoid coercion by the SDK's generated union types.
         return _attempt_result(
-            response._response.json(), response.status_code, response.headers, config, started_at
+            body, response.status_code, response.headers, config, started_at
         )
     finally:
         response.close()

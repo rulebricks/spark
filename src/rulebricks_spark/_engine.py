@@ -194,7 +194,7 @@ def make_partition_worker(
                     )
                     # A bulk response may already contain later committed events.
                     # Stop this partition; a checkpointed caller discards the window.
-                    if (config.max_batch_rows or 1) > 1:
+                    if len(chunk) > 1:
                         blocked = True
             return _outcomes_to_arrow(outcomes, config, source_columns, arrow_schema)
 
@@ -214,7 +214,7 @@ def make_partition_worker(
 
 def _prepare_chunks(batch_iter, config: RunConfig, input_names: Sequence[str]):
     """Read Arrow only on the task thread, with bounded decoded input."""
-    chunker = ByteChunker(config.max_batch_bytes, min(config.max_batch_rows or 10000, 10000))
+    chunker = ByteChunker(config.max_batch_bytes, config.max_batch_rows)
     for batch in batch_iter:
         for offset in range(0, batch.num_rows, 1000):
             rows = batch.slice(offset, 1000).to_pylist(maps_as_pydicts="strict")

@@ -35,7 +35,7 @@ are returned as data.
 | `execution_partitions` | `1`, or automatic with a row budget | Advanced Spark producer override. Omission derives partitioning from the request plan when `max_inflight_rows` is supplied; otherwise keeps one partition. `None` preserves source partitions. An explicit or preserved count must fit the row budget |
 | `max_inflight_rows` | `None` | Planned outstanding rows across this execution. Omit `max_batch_rows` for automatic tuning or supply it for manual batching. Both modes refill individual requests; see [row budget](../execution-model.md#row-budget) |
 | `max_batch_bytes` | `67108864` (64 MiB) | Positive byte ceiling on encoded request bodies, including the outer array; does not disable tuning |
-| `max_batch_rows` | `1000`, or automatic with a row budget | An explicit positive integer selects manual batching with that ceiling. Explicit `None` selects manual batching with the internal 10,000-row cap. Omission retains legacy behavior without a row budget and enables tuning with one |
+| `max_batch_rows` | `1000`, or automatic with a row budget | Integer: manual row ceiling. `None`: manual with no row ceiling. Omit to tune with a row budget, or keep 1,000 rows without one |
 | `max_retries` | `3` | Nonnegative number of retries after the first attempt |
 | `timeout_seconds` | `300` | Positive timeout for a synchronous request |
 | `output_schema` | None | Spark DataType used for typed conversion |

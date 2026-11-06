@@ -14,137 +14,65 @@ retains the historical default of one partition. Explicitly passing
 
 ## Row budget
 
-For independent input rows, choose the maximum planned number of outstanding
-rows. The library automatically chooses batching and Spark partitioning:
+`max_inflight_rows=B` enables concurrent execution for independent rows.
+Let `M = max_batch_rows` (infinity when omitted or `None`) and
+`L = max_batch_bytes` (64 MiB by default):
 
-```python
-result = apply_flow(
-    df,
-    "decision-flow",
-    api_key=api_key,
-    base_url=base_url,
-    max_inflight_rows=128,
-)
+```text
+sum(inflight request rows) <= B
+batch rows <= min(M, available task rows, max(1, rows fitting in L bytes))
+nominal manual requests = ceil(B / M)     # integer M; e.g. 128 / 4 = 32
 ```
 
-If you have measured a preferred batch size, supply `max_batch_rows` too:
+- Omit `max_batch_rows`: automatic batching.
+- Supply an integer: manual batching with that row ceiling.
+- Supply `None`: manual batching without a row ceiling.
 
-```python
-result = apply_flow(
-    df,
-    "decision-flow",
-    api_key=api_key,
-    base_url=base_url,
-    max_inflight_rows=128,
-    max_batch_rows=4,
-)
-```
+Both modes refill individual requests and retain allowances through retries and
+splitting. Byte limits do not disable tuning. `apply_rule()` and DataFrame
+`resume()` use the same model; use `foreachBatch` for streaming input.
 
-The second example selects **manual batching**, with a nominal plan of
-**32 requests × 4 rows** (`max_inflight_rows / max_batch_rows` for full batches).
-The library does not automatically tune the batch size. Both modes admit
-replacement work as individual requests finish, retaining each request's row
-allowance through retries and splitting. Neither mode waits for a group of
-requests to finish before refilling.
-
-| Arguments | Behavior |
-| --- | --- |
-| `max_inflight_rows` alone | Automatically choose partitioning and tune batching |
-| `max_inflight_rows` plus explicit `max_batch_rows` | Use the supplied batch ceiling without tuning; derive partitioning from the request plan |
-| `max_inflight_rows` plus `execution_partitions` | Override Spark producer count; batching still tunes unless `max_batch_rows` is explicit |
-| No `max_inflight_rows` | Preserve one request at a time per task, the default one partition, and the default 1,000-row ceiling |
-
-`max_batch_bytes` remains a request ceiling, defaulting to 64 MiB; setting it
-does not disable tuning. Explicit `max_batch_rows=1000` selects manual batching
-even though its value equals the legacy default. Explicit `max_batch_rows=None`
-also selects manual batching, retaining the existing 10,000-row safety cap.
-Omitting `max_batch_rows` in automatic mode retains the 1,000-row safety ceiling.
-
-`apply_rule()` and DataFrame `resume()` accept the same options. Recovery chooses
-a fresh plan for selected failed rows; it does not inherit the original tuning
-mode or concurrency budget. Execution remains lazy. Use `foreachBatch` for
-streaming input.
+Without `max_inflight_rows`, the default remains one request at a time per task
+and 1,000 rows per request.
 
 ## Partition planning
 
-Normal callers can leave `execution_partitions` omitted. The SDK first forms a
-request plan from the row budget and batch size, then distributes it across
-Spark producers. Automatic mode uses four rows as an initial planning estimate;
-manual mode uses the explicit ceiling, clipped to the row budget and the internal
-10,000-row safety cap. The plan contains full requests plus at most one partial
-request for any remainder.
+The default Spark task count follows the initial request plan:
 
-The planner aims for four overlapping requests per task, capped by Spark's
-default parallelism and the number of full requests. It does not create a task
-solely for the partial remainder. For example, with sufficient Spark parallelism,
-128 rows with four-row batches plans 32 requests across eight tasks; 128 rows
-with 32-row batches plans four requests in one task. These are initial plans,
-not estimates of Rulebricks worker count or a guarantee of optimal throughput.
+```text
+m = min(4, B) in automatic mode; min(M, B) in manual mode
+q = ceil(B / m)
+p = min(ceil(q / 4), floor(B / m), Spark default parallelism)
+sum(task row allowances) = B
+```
 
-Manual task allowances preserve full batches wherever the producer count permits.
-For example, 128 rows with four-row batches and six explicit partitions gives
-allowances of 24, 24, 20, 20, 20, and 20 rows: exactly 32 full request slots.
-Automatic mode distributes its initial request plan in the same way, then lets
-each task tune within its fixed allowance. The allowances always sum to the
-configured row budget.
-
-An explicit `execution_partitions=N` uses N producers; `None` preserves the input
-partition count. Either count must fit within the row budget. An override with
-more producers than full requests splits the allowance into smaller batches so
-every input partition can progress. Byte limits, local validation failures, and
-partition tails can also shorten requests. Leave partitioning automatic when
-preserving the measured batch size matters.
-
-Each task has at most 32 concurrent request threads. Spark's default parallelism
-is a planning hint, and actual outstanding work can be lower when fewer tasks
-run, input is skewed, retries back off, or partitions finish. Finished partitions
-do not lend their allowances to remaining tasks. A very small producer override
-can also prevent the thread limit from filling a large row budget.
-
-Downstream `coalesce()` can reduce simultaneously running execution tasks. To
-change output file counts without constraining API parallelism, save results
-first and compact the saved data. Spark's Arrow buffers are separate from the
-row allowance; size `spark.sql.execution.arrow.maxRecordsPerBatch` for executor
-memory when payloads are large. Spark needs resources to prepare requests and
-consume results, and competes with Rulebricks when they share nodes.
+`execution_partitions` overrides `p`; `None` preserves input partitions. The count
+must be at most `B`. Each task has at most 32 request threads. Allowances remain
+with their tasks when partitions finish. Byte limits and partition tails can
+shorten batches; downstream `coalesce()` can reduce active execution tasks.
 
 ## Automatic batch tuning
 
-When `max_batch_rows` is omitted, each task derives its initial concurrency from
-the four-row request plan, subject to the 32-thread cap. It uses at least four
-overlapping requests when its allowance permits, or more if byte ceilings require
-it, dividing its allowance into balanced slots. For example, a 16-row task allowance normally starts as
-four four-row requests. It can try larger batches with fewer requests or smaller
-batches with more requests, keeping its allowance fixed. There are at most two
-distinct candidate configurations per task. Requests refill individually
-throughout the search, without replaying successful rows.
+For task allowance `R`, newly prepared row count `n`, and average encoded row
+size `s`:
 
-The score is **reserved row-seconds per correctly completed row**. Lower scores
-mean rows occupy the allowance for less time. To avoid changing settings because
-of unusually easy input or transient latency:
+```text
+weight = 1 - exp(-n / R)
+mean_bytes += weight * (s - mean_bytes)
+request_seed = min(R, clamp(ceil(R * (mean_bytes + 1) / 256 KiB), 2, 4))
 
-- Ignore initial and configuration-change warmup, mixed-generation completions,
-  and partially filled final batches.
-- Collect at least four groups of completions per measurement window. Each group
-  contains at least one task allowance of completed rows and four completed
-  requests. Slow requests remain in the overall score and in their group.
-- Check the original configuration, the candidate, the original again, and the
-  candidate again (**A-B-A-B**). Both candidate windows must improve the overall
-  score by more than 10% against both baseline windows.
-- Also require the candidate's upper quartile of group scores to be more than
-  10% below the baseline's lower quartile in each comparison. Overlapping groups
-  are inconclusive, even if their average scores look better.
-- Reject inconclusive candidates and keep the last accepted configuration.
-  Failures or retries stop exploration and restore that configuration; normal
-  retry, backoff, splitting, and error reporting still apply.
+minimize sum(reserved_rows * request_seconds) / correctly_completed_rows
+```
 
-These are conservative empirical guards, not confidence intervals or a guarantee
-of a global optimum. Different windows execute different rows, and concurrent
-requests share backend capacity. Changing input mix or correlated load can
-confound measurements, so the search can reject a real but noisy improvement.
-Measurement sizes depend on completed work, rather than assumed processing time.
-Probes can slow shorter jobs; there is no persistent cross-job tuning cache or
-extra driver service. Supply `max_batch_rows` when you prefer a measured setting.
+The mean starts with the first batch and reuses encoded byte counts. Rows are
+counted once. Actual byte packing reacts immediately to larger or smaller rows.
+A doubling or halving of the mean after an allowance of new rows reopens timing
+comparisons around the working plan.
+
+Accept a batch-size change only after repeated timing comparisons show over 10%
+improvement beyond observed variation. Trial work is bounded; errors or retries
+stop tuning. Successful rows are never replayed. Short jobs may keep their
+starting plan; tuning is local to each task.
 
 ## Measuring and bounding concurrency
 
@@ -169,23 +97,15 @@ retain their original row allowance until the chunk completes.
 For ordered state changes, use `contexts.apply_stateful_flow()`. The row-budget
 modes are for independent rows and do not preserve cross-request event order.
 The planner logs the partition count and per-task budget at INFO through
-`rulebricks_spark._apply`. Each task logs its selected request width and
-measurement summary through `rulebricks_spark._adaptive` at INFO.
+`rulebricks_spark._apply`. Tasks log a summary at INFO through
+`rulebricks_spark._adaptive`; detailed timing measurements require DEBUG.
 
 ## Request sizing
 
-The default request limits are:
-
-- 64 MiB encoded JSON
-- 1,000 input rows
-
-These are ceilings; automatic mode can choose smaller requests. In manual or legacy mode, the first limit reached closes the request, also respecting
-any remaining task row allowance. Use `max_batch_bytes` and
-`max_batch_rows` to override the defaults. The byte default was previously 5 MiB;
-set `max_batch_bytes=5 * 1024 * 1024` explicitly to retain that packing limit.
-Endpoint and proxy limits still apply: a 64 MiB SDK ceiling does not configure
-the server to accept that size. An individual row larger than the byte limit is
-still sent alone so the service can return a precise payload-size error.
+`max_batch_bytes` defaults to 64 MiB. Without a row budget, `max_batch_rows`
+defaults to 1,000; `None` removes that row limit. Endpoint and proxy limits still
+apply. A single row larger than the byte ceiling is sent alone so the service
+can return a precise payload-size error.
 
 Rulebricks Spark automatically splits a rejected oversized request. It also
 uses bounded bisection for HTTP 500 failures when `isolate_failures=True` so
@@ -261,10 +181,9 @@ number: `latest` and environment aliases remain mutable between calls.
 
 ## Memory and source values
 
-The worker decodes at most 1,000 Arrow rows at a time and retains at most
-10,000 records per HTTP chunk, even if `max_batch_rows=None`. Both HTTP limits
-are upper bounds; partitions and the internal buffer cap can produce smaller
-requests. Payload bytes exclude unused source columns and response expansion.
+Arrow decoding uses slices of at most 1,000 rows, further bounded by the task
+allowance in row-budget mode. Request packing follows the configured row and
+byte limits. Payload bytes exclude unused source columns and response expansion.
 Select only necessary source columns for wide datasets and tune Spark's
 `spark.sql.execution.arrow.maxRecordsPerBatch` separately.
 
@@ -280,7 +199,7 @@ slot. With `on_error="raise"`, an observed failure stops new submissions, but
 already-issued requests may have executed. Closing the iterator cancels queued
 work and retry waits, then waits for running HTTP calls before closing their
 clients. It cannot cancel server-side execution. A blocking HTTP call can still
-take its configured timeout to return. Existing callers that omit the target
+take its configured timeout to return. Existing callers that omit `max_inflight_rows`
 retain their sequential request and response-callback behavior.
 
 Timestamps with a timezone preserve their UTC instant. `TimestampNTZType`

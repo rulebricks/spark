@@ -1,6 +1,7 @@
 """Request scheduling for independent rows with a fixed row allowance."""
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -8,7 +9,16 @@ from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecut
 from contextlib import ExitStack
 
 from ._batch_policy import BatchPolicy, Slot
-from ._config import initial_batch_rows
+
+# Byte-size seed; measured timings choose the working plan.
+_INITIAL_REQUEST_BYTES = 256 * 1024
+
+
+def initial_requests(row_budget, average_bytes):
+    if average_bytes is None:
+        return 4
+    # Preserve overlap for tiny payloads; the policy also enforces byte limits.
+    return min(4, max(2, math.ceil(row_budget * (average_bytes + 1) / _INITIAL_REQUEST_BYTES)))
 
 
 class RecordStream:
@@ -19,7 +29,12 @@ class RecordStream:
 
         self.config = config
         self.buffer = deque()
-        self.max_rows = min(config.max_batch_rows or 10000, 10000)
+        tune_sizes = config.tunes_batches
+        self.max_rows = row_budget if tune_sizes else (config.max_batch_rows or row_budget)
+        self.row_budget = row_budget
+        self.average_payload_bytes = None
+        self.observed_rows = 0
+        self._new_rows = self._new_bytes = 0
 
         def records():
             for batch in batches:
@@ -29,9 +44,14 @@ class RecordStream:
                     ):
                         source = dict(zip(names, values.values()))
                         try:
-                            yield engine._make_record(source, config)
+                            record = engine._make_record(source, config)
                         except Exception as exc:
                             yield engine._local_payload_failure(source, exc, config)
+                        else:
+                            if tune_sizes:
+                                self._new_rows += 1
+                                self._new_bytes += record.payload_bytes
+                            yield record
 
         self.records = iter(records())
 
@@ -39,6 +59,21 @@ class RecordStream:
         self.buffer.extendleft(reversed(items))
 
     def take(self, capacity):
+        result = self._take(capacity)
+        if self._new_rows:
+            average = self._new_bytes / self._new_rows
+            if self.average_payload_bytes is None:
+                self.average_payload_bytes = average
+            else:
+                # Weight by newly encoded rows, rather than request count.
+                # One allowance of new input replaces ~63% of the old mean.
+                weight = -math.expm1(-self._new_rows / self.row_budget)
+                self.average_payload_bytes += weight * (average - self.average_payload_bytes)
+            self.observed_rows += self._new_rows
+            self._new_rows = self._new_bytes = 0
+        return result
+
+    def _take(self, capacity):
         from . import _engine as engine
 
         chunk = []
@@ -77,13 +112,16 @@ def row_budget_outcomes(stream, config, slots, *, row_budget):
             min(row_budget, stream.max_rows) if isinstance(first, engine.RowOutcome) else len(first)
         )
         stream.prepend([first] if isinstance(first, engine.RowOutcome) else first)
-        batch_rows = initial_batch_rows(config.max_batch_rows, row_budget)
+        width = initial_requests(row_budget, stream.average_payload_bytes)
         policy = BatchPolicy(
             row_budget,
             fitted,
             max_requests=slots,
-            initial_requests=max(4, (row_budget + batch_rows - 1) // batch_rows),
+            initial_requests=width,
+            startup_trial=width < 4,
         )
+    payload_profile = stream.average_payload_bytes
+    profile_rows = stream.observed_rows
     local = threading.local()
     client_lock = threading.Lock()
     cancelled = threading.Event()
@@ -110,8 +148,26 @@ def row_budget_outcomes(stream, config, slots, *, row_budget):
         pool = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="rulebricks-rows")
 
         def refill():
-            nonlocal reserved, exhausted, peak_rows, peak_requests
+            nonlocal reserved, exhausted, peak_rows, peak_requests, payload_profile, profile_rows
             while not exhausted and len(pending) < slots:
+                average = stream.average_payload_bytes
+                if policy is not None and average is not None:
+                    if payload_profile is None:
+                        payload_profile, profile_rows = average, stream.observed_rows
+                    elif stream.observed_rows - profile_rows >= row_budget and (
+                        average >= 2 * payload_profile or 2 * average <= payload_profile
+                    ):
+                        fitted_rows = None
+                        if 2 * average <= payload_profile:
+                            fitted_rows = max(
+                                1,
+                                min(
+                                    stream.max_rows,
+                                    int((config.max_batch_bytes - 2) / (average + 1)),
+                                ),
+                            )
+                        policy.reconsider(fitted_rows=fitted_rows)
+                        payload_profile, profile_rows = average, stream.observed_rows
                 available = row_budget - reserved
                 if available <= 0:
                     return
@@ -127,6 +183,10 @@ def row_budget_outcomes(stream, config, slots, *, row_budget):
                     return
                 n = 1 if isinstance(item, engine.RowOutcome) else len(item)
                 if byte_limited and policy is not None and policy.constrain_batch_rows(n):
+                    payload_profile, profile_rows = (
+                        stream.average_payload_bytes,
+                        stream.observed_rows,
+                    )
                     stream.prepend(item)
                     continue
                 # Adaptive plans reserve whole balanced slots. Manual packing
@@ -179,9 +239,10 @@ def row_budget_outcomes(stream, config, slots, *, row_budget):
                 future.cancel()
             # In-progress HTTP calls cannot be revoked; join before closing clients.
             pool.shutdown(wait=True, cancel_futures=True)
-            logging.getLogger(__name__).info(
-                "Rulebricks batch plan: adaptive=%s row_allowance=%s completed_rows=%s peak_reserved_rows=%s "
-                "peak_requests=%s selected_requests=%s probes=%s measurements=%s",
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "Rulebricks batch plan: automatic=%s row_allowance=%s completed_rows=%s peak_reserved_rows=%s "
+                "peak_requests=%s selected_requests=%s comparisons=%s",
                 config.tunes_batches,
                 row_budget,
                 completed,
@@ -189,5 +250,11 @@ def row_budget_outcomes(stream, config, slots, *, row_budget):
                 peak_requests,
                 policy.best_width if policy is not None else None,
                 policy.probes if policy is not None else 0,
-                policy.events if policy is not None else [],
             )
+            if policy is not None and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Rulebricks batch timings: payload_mean_bytes=%s observed_payload_rows=%s measurements=%s",
+                    stream.average_payload_bytes,
+                    stream.observed_rows,
+                    list(policy.events),
+                )

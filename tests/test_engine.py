@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import httpx
 import pyarrow as pa
 import pytest
-from pyspark.sql.types import LongType, StructField, StructType
+from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from rulebricks_spark import ExecutionError, _engine
 from rulebricks_spark._engine import _execute_chunk, _make_record, make_partition_worker
@@ -113,7 +113,10 @@ def test_connection_errors_retry_but_programming_errors_do_not(config, sdk, monk
         assert outcome.metadata["_rb_error_type"] == category
 
 
-def test_arrow_buffers_are_bounded_and_client_closes_on_cancellation(config, sdk, monkeypatch):
+@pytest.mark.parametrize(
+    "batch_rows,expected", [(None, [15000]), (12000, [12000, 3000]), (1000, [1000] * 15)]
+)
+def test_row_limit_and_client_cleanup(config, sdk, monkeypatch, batch_rows, expected):
     from rulebricks_spark._transport import sdk_client
 
     clients = []
@@ -126,7 +129,7 @@ def test_arrow_buffers_are_bounded_and_client_closes_on_cancellation(config, sdk
 
     monkeypatch.setattr("rulebricks_spark._transport.httpx.Client", capture_client)
     config.input_columns = []
-    config.max_batch_rows = None
+    config.max_batch_rows = batch_rows
     schema = build_execution_schema(StructType([StructField("id", LongType())]))
     calls = []
 
@@ -142,8 +145,35 @@ def test_arrow_buffers_are_bounded_and_client_closes_on_cancellation(config, sdk
     worker = make_partition_worker(config, ["id"], schema)
     batch = pa.record_batch([list(range(15000))], names=["id"])
     assert sum(part.num_rows for part in worker(iter([batch]))) == 15000
-    assert calls == [10000, 5000] and clients[0].is_closed
+    assert calls == expected and clients[0].is_closed
     iterator = worker(iter([batch]))
     next(iterator)
     iterator.close()
     assert clients[1].is_closed
+
+
+@pytest.mark.parametrize("batch_rows", [None, 2])
+def test_failed_stateful_bulk_stops_later_requests_with_or_without_a_row_limit(
+    config, monkeypatch, batch_rows
+):
+    from tests.test_concurrency import capture_clients
+
+    inputs = [{"key": key, "seq": seq} for key in ["a", "b"] for seq in [1, 2]]
+    config.state_key = "key"
+    config.max_batch_rows = batch_rows
+    config.max_batch_bytes = len(json.dumps(inputs[:2], separators=(",", ":")).encode())
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=[{"error": "failed"}, {"seq": 2}])
+
+    capture_clients(monkeypatch, handler)
+    schema = StructType([StructField("key", StringType()), StructField("seq", LongType())])
+    worker = make_partition_worker(config, ["key", "seq"], build_execution_schema(schema))
+    actual = [r for b in worker(iter([pa.RecordBatch.from_pylist(inputs)])) for r in b.to_pylist()]
+    assert requests == [inputs[:2]]
+    assert [r["_rb_status"] for r in actual[:2]] == ["execution_error", "ok"]
+    assert all(
+        r["_rb_error_type"] == "context_blocked" and r["_rb_attempts"] == 0 for r in actual[2:]
+    )

@@ -76,29 +76,19 @@ def apply_rule(
         Maximum encoded request body size; defaults to 64 MiB. Server limits
         still apply. Automatic mode may choose smaller requests.
     max_batch_rows:
-        Maximum rows in one request. Without max_inflight_rows, omission keeps
-        the legacy 1,000-row ceiling. With a row budget, omission enables
-        automatic tuning; explicitly supplying a value selects manual batching
-        without automatic tuning. None explicitly uses the 10,000-row safety cap.
-        Byte limits, remaining allowances, and partition tails can shorten batches.
+        Omit for automatic batching with max_inflight_rows, or 1,000 rows per
+        request without it. An explicit integer or None disables tuning; None
+        removes the per-request row limit. Byte limits and row budgets still apply.
     execution_partitions:
-        Optional Spark producer override. With a row budget, omission derives
-        partitioning from the request plan, aiming for four overlapping requests
-        per task within Spark default parallelism. Without a budget, omission
-        keeps one partition. None preserves source partitions. An explicit or
-        preserved count must not exceed the row budget; too many producers can
-        require smaller batches. This argument alone does not disable tuning.
+        Spark task count override. Omit to derive it from the row budget, or
+        keep one task without a budget. None preserves input partitions.
+        With a row budget, the task count must not exceed it.
     max_inflight_rows:
-        Optional positive planned row allowance across this execution. Omit
-        max_batch_rows to tune batching automatically, or supply it to use a
-        measured batch size. Both modes refill individual completed requests
-        immediately and retain allowances through retries and splitting.
-        Fixed per-partition allowances are not transferred when tasks finish.
-        Each task uses at most 32 request threads. Actual concurrency depends
-        on scheduled tasks and available input; task retries and remote work
-        surviving timeouts can exceed the plan. Only independent rows are
-        supported. Results can arrive out of order while source/result alignment
-        is preserved. None retains one request at a time per Spark task.
+        Planned outstanding rows across this execution, for independent inputs.
+        Requests refill individually; retries and splitting retain their row
+        allowance. Task allowances are fixed and are not transferred when tasks
+        finish. None keeps one request at a time per task. See the execution
+        model for Spark retries, speculation, and server-side timeout behavior.
     max_retries:
         Inline retries for transient request failures.
     timeout_seconds:

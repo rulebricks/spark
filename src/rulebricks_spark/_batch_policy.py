@@ -1,4 +1,4 @@
-"""Conservative, bounded batch-size exploration under a fixed row allowance."""
+"""Compare request plans while bounding the rows spent trying alternatives."""
 
 from collections import deque
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from statistics import quantiles
 class Slot:
     generation: int
     capacity: int
+    exploratory: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,9 @@ class BatchPolicy:
         fitted_batch_rows,
         max_requests=32,
         improvement=0.10,
-        max_probes=2,
+        max_probes=None,
         initial_requests=4,
+        startup_trial=False,
     ):
         self.rows = rows
         self.max_requests = min(rows, max_requests)
@@ -47,8 +49,16 @@ class BatchPolicy:
         self.width = min(self.max_requests, max(initial_requests, self.minimum_width))
         self.best_width = self.width
         self.improvement = improvement
-        self.max_probes = max_probes
+        # Each input profile tests a width once; successful work funds trials.
+        self.max_probes = self.max_requests - 1 if max_probes is None else max_probes
         self.probes = 0
+        # Bound trial rows; individual request latency remains unconstrained.
+        self.baseline_completed_rows = 0
+        self.trial_admitted_rows = 0
+        # Compact payloads can fund one early comparison.
+        self.startup_trial = startup_trial
+        self.startup_trial_rows = 0
+        self.failed = False
         self.generation = -1
         self.phase = "baseline"
         self.baseline = None
@@ -56,14 +66,18 @@ class BatchPolicy:
         self.trial = None
         self.trial_width = None
         self.tested_widths = {self.width}
-        self.events = []
+        # Internal tuner diagnostics, separate from decision logs and traces.
+        self.events = deque(maxlen=128)
         self._set_width(self.width)
 
     def _set_width(self, width, warmup=True):
         self.width = width
         self.generation += 1
         base, extra = divmod(self.rows, width)
-        self.ready = deque(Slot(self.generation, base + int(i < extra)) for i in range(width))
+        self.ready = deque(
+            Slot(self.generation, base + int(i < extra), width != self.best_width)
+            for i in range(width)
+        )
         self.warmup_rows = self.rows if warmup else 0
         self.completed_rows = self.completions = 0
         self.row_seconds = 0.0
@@ -77,6 +91,23 @@ class BatchPolicy:
         # Old requests retain their allowances through a plan change.
         for slot in self.ready:
             if slot.capacity <= available_rows:
+                if slot.exploratory:
+                    if self.trial_admitted_rows + slot.capacity > (
+                        self.baseline_completed_rows // 9 + self.startup_trial_rows
+                    ):
+                        self.events.append(
+                            {
+                                "event": "learning_budget_exhausted",
+                                "width": self.width,
+                                "phase": self.phase,
+                                "baseline_rows": self.baseline_completed_rows,
+                                "trial_rows": self.trial_admitted_rows,
+                                "startup_trial_rows": self.startup_trial_rows,
+                            }
+                        )
+                        self.freeze()
+                        return self.claim(available_rows)
+                    self.trial_admitted_rows += slot.capacity
                 self.ready.remove(slot)
                 return slot
         return None
@@ -110,6 +141,25 @@ class BatchPolicy:
             if width != self.best_width and width not in self.tested_widths
         ]
 
+    def reconsider(self, fitted_rows=None):
+        """Recheck a changed input mix without discarding the working plan."""
+        if self.failed or self.probes >= self.max_probes:
+            return False
+        if fitted_rows is not None:
+            self.minimum_width = min(
+                self.max_requests, max(1, (self.rows + fitted_rows - 1) // fitted_rows)
+            )
+            self.best_width = max(self.best_width, self.minimum_width)
+        self.phase = "baseline"
+        self.baseline = self.repeated_baseline = self.trial = None
+        self.trial_width = None
+        self.tested_widths = {self.best_width}
+        self.events.append({"event": "payload_size_changed", "width": self.best_width})
+        # Keep the global trial budget and probe count; a changing input mix
+        # must not buy unlimited experiments or override an earlier failure.
+        self._set_width(self.best_width)
+        return True
+
     def _better(self, candidate, *baselines):
         margin = 1 - self.improvement
         return all(
@@ -126,9 +176,12 @@ class BatchPolicy:
     def finish(
         self, slot, *, rows, seconds, correct=True, retried=False, stable=True, partial_tail=False
     ):
+        if not slot.exploratory and correct and not retried:
+            self.baseline_completed_rows += rows
         if slot.generation == self.generation:
             self.ready.append(slot)
         if not correct or retried:
+            self.failed = True
             self.freeze()
             return
         if (
@@ -153,7 +206,7 @@ class BatchPolicy:
         # Pool completions into blocks instead of treating overlapping HTTP
         # requests as independent timing observations. Keep slow requests in
         # both the overall score and their block; do not trim tail latency.
-        if self.block_rows < self.rows or self.block_completions < 4:
+        if self.block_rows < self.rows:
             return
         self.block_scores.append(self.block_seconds / self.block_rows)
         self.block_rows = self.block_completions = 0
@@ -181,7 +234,28 @@ class BatchPolicy:
             if not candidates or self.probes >= self.max_probes:
                 self.freeze()
                 return
-            self.trial_width = candidates[0]
+            candidate = candidates[0]
+            # Reserve enough earned work for both candidate measurements,
+            # including warmup and one allowance of transition overhead.
+            trial_allowance = 2 * (2 * self.rows + 4 * self.rows)
+            if self.startup_trial:
+                self.startup_trial_rows = trial_allowance
+                self.startup_trial = False
+            available = (
+                self.baseline_completed_rows // 9
+                + self.startup_trial_rows
+                - self.trial_admitted_rows
+            )
+            if available < trial_allowance:
+                # Keep refilling the established plan while more successful
+                # work earns room for learning. No phase transition or pause.
+                self.completed_rows = self.completions = 0
+                self.row_seconds = 0.0
+                self.block_rows = self.block_completions = 0
+                self.block_seconds = 0.0
+                self.block_scores = []
+                return
+            self.trial_width = candidate
             self.tested_widths.add(self.trial_width)
             self.probes += 1
             self.phase = "trial"

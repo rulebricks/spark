@@ -18,7 +18,7 @@ credentials are always supplied again by the caller.
 | --- | --- | --- |
 | `api_key`, `base_url` | Required | Execution credentials and API URL |
 | `error_types` | `network`, `infrastructure`, `throttled`, `server` | Categories selected for re-execution |
-| `max_batch_bytes`, `max_batch_rows` | 64 MiB; `1000` or automatic with a row budget | Byte ceiling and optional manual batch ceiling; explicit `None` retains the 10,000-row cap |
+| `max_batch_bytes`, `max_batch_rows` | 64 MiB; `1000` or automatic with a row budget | Byte ceiling and optional manual row ceiling; `None` removes the row ceiling |
 | `execution_partitions` | `1`, or automatic with a budget | Same partition planning as `apply_flow()` |
 | `max_inflight_rows` | `None` | Planned row budget for concurrent recovery. Omit `max_batch_rows` to tune batching or supply it for manual batching; same semantics as `apply_flow()` |
 | `max_retries` | `3` | Inline transient retries after each first attempt |
