@@ -104,7 +104,11 @@ def test_bulk_paths_preserve_sdk_escaping(config, sdk, asset_type):
     config.slug = "name with /?#日本語"
     config.version = "release/1"
     resource = sdk.client.flows if asset_type == "flow" else sdk.client.rules
-    method = resource.with_raw_response.execute if asset_type == "flow" else resource.with_raw_response.bulk_solve
+    method = (
+        resource.with_raw_response.execute
+        if asset_type == "flow"
+        else resource.with_raw_response.bulk_solve
+    )
     reference = method(config.slug, version=config.version, request=[{}])
     reference.close()
     run_attempt(sdk.client, config, [{}])

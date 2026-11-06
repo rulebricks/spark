@@ -107,9 +107,7 @@ def run_attempt(client: Any, config: RunConfig, payloads: List[Dict[str, Any]]) 
             raise ApiError(
                 status_code=response.status_code, headers=dict(response.headers), body=body
             )
-        return _attempt_result(
-            body, response.status_code, response.headers, config, started_at
-        )
+        return _attempt_result(body, response.status_code, response.headers, config, started_at)
     finally:
         response.close()
 
